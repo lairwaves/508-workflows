@@ -4,9 +4,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from five08.worker.crm.docuseal_processor import DocusealAgreementProcessor
 from five08.worker.crm.people_sync import PeopleSyncProcessor
 from five08.worker.crm.processor import ContactSkillsProcessor
 from five08.worker.crm.resume_profile_processor import ResumeProfileProcessor
+from five08.worker.masking import mask_email
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,21 @@ def apply_resume_profile_job(
         link_discord=link_discord,
     )
     return result.model_dump()
+
+
+def process_docuseal_agreement_job(
+    email: str,
+    completed_at: str,
+    submission_id: int,
+) -> dict[str, Any]:
+    """Mark a CRM contact as having signed the member agreement via Docuseal."""
+    logger.info(
+        "Processing Docuseal agreement job masked_email=%s submission_id=%s",
+        mask_email(email),
+        submission_id,
+    )
+    processor = DocusealAgreementProcessor()
+    return processor.process_agreement(email, completed_at, submission_id)
 
 
 def sync_people_from_crm_job() -> dict[str, Any]:

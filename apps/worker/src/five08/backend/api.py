@@ -54,16 +54,22 @@ from five08.backend.auth import (
 from five08.worker.config import settings
 from five08.worker.db_migrations import run_job_migrations
 from five08.worker.dispatcher import build_queue_client
+from five08.worker.masking import mask_email
 from five08.worker.jobs import (
     apply_resume_profile_job,
     extract_resume_profile_job,
     process_contact_skills_job,
+    process_docuseal_agreement_job,
     process_webhook_event,
     sync_people_from_crm_job,
     sync_person_from_crm_job,
 )
 from five08.worker.mailbox_resume_ingest import ResumeMailboxProcessor
-from five08.worker.models import AuditEventPayload, EspoCRMWebhookPayload
+from five08.worker.models import (
+    AuditEventPayload,
+    DocusealWebhookPayload,
+    EspoCRMWebhookPayload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +103,13 @@ def _is_authorized(request: Request) -> bool:
         logger.error("Rejecting request: API_SHARED_SECRET is not configured")
         return False
 
+    # TODO: security-hardening: move webhook auth to per-webhook generated secrets
+    # sourced from an admin dashboard with copyable callback URLs.
     provided_secret = request.headers.get("X-API-Secret", "")
-    return secrets.compare_digest(provided_secret, settings.api_shared_secret)
+    if secrets.compare_digest(provided_secret, settings.api_shared_secret):
+        return True
+
+    return False
 
 
 def _extract_idempotency_key(value: object) -> str | None:
@@ -680,6 +691,123 @@ async def espocrm_people_sync_webhook_handler(request: Request) -> JSONResponse:
     )
 
 
+async def docuseal_webhook_handler(request: Request) -> JSONResponse:
+    """Process a Docuseal form.completed webhook and enqueue agreement job."""
+    if not _is_authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload_data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    if not isinstance(payload_data, dict):
+        return JSONResponse({"error": "payload_must_be_object"}, status_code=400)
+
+    try:
+        payload = DocusealWebhookPayload.model_validate(payload_data)
+    except (ValidationError, TypeError) as exc:
+        return JSONResponse(
+            {"error": "invalid_payload", "detail": str(exc)},
+            status_code=400,
+        )
+
+    if payload.event_type != "form.completed":
+        return JSONResponse(
+            {
+                "status": "ignored",
+                "reason": f"unhandled event_type: {payload.event_type}",
+            },
+            status_code=200,
+        )
+
+    submitter = payload.data
+    submission_id = (
+        submitter.submission_id if submitter.submission_id is not None else submitter.id
+    )
+
+    template_filter_id = settings.docuseal_member_agreement_template_id
+    if template_filter_id is None:
+        logger.info("Ignoring Docuseal agreement webhook: template filter is unset")
+        return JSONResponse(
+            {
+                "status": "ignored",
+                "reason": "template_filter_not_configured",
+            },
+            status_code=200,
+        )
+
+    template_id = submitter.template.id if submitter.template else None
+    if template_id != template_filter_id:
+        logger.info(
+            "Ignoring Docuseal agreement webhook for unmatched template_id=%s"
+            " expected=%s submission_id=%s",
+            template_id,
+            template_filter_id,
+            submission_id,
+        )
+        return JSONResponse(
+            {
+                "status": "ignored",
+                "reason": "template_mismatch",
+                "submission_id": submission_id,
+            },
+            status_code=200,
+        )
+
+    email = (submitter.email or "").strip()
+
+    completed_at = submitter.completed_at or payload.timestamp
+    if isinstance(completed_at, str):
+        completed_at = completed_at.strip()
+    if not isinstance(completed_at, str) or not completed_at:
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+
+    try:
+        datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+
+    if not email:
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+
+    masked_email = mask_email(email)
+
+    queue = request.app.state.queue
+    try:
+        job: EnqueuedJob = await asyncio.to_thread(
+            enqueue_job,
+            queue=queue,
+            fn=process_docuseal_agreement_job,
+            args=(email, completed_at, submission_id),
+            settings=settings,
+            idempotency_key=f"docuseal-agreement:{submission_id}",
+        )
+    except Exception:
+        logger.exception(
+            "Failed enqueueing Docuseal agreement job masked_email=%s submission_id=%s",
+            masked_email,
+            submission_id,
+        )
+        return JSONResponse({"error": "enqueue_failed"}, status_code=503)
+
+    logger.info(
+        "Enqueued Docuseal agreement job job_id=%s masked_email=%s",
+        job.id,
+        masked_email,
+    )
+    return JSONResponse(
+        {
+            "status": "queued",
+            "source": "docuseal",
+            "job_id": job.id,
+            "masked_email": masked_email,
+            "submission_id": submission_id,
+        },
+        status_code=202,
+    )
+
+
 async def audit_event_handler(request: Request) -> JSONResponse:
     """Persist one human audit event."""
     if not _is_authorized(request):
@@ -1226,6 +1354,11 @@ def create_app(*, run_lifespan: bool = True) -> FastAPI:
     app.add_api_route(
         "/webhooks/espocrm/people-sync",
         espocrm_people_sync_webhook_handler,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/webhooks/docuseal",
+        docuseal_webhook_handler,
         methods=["POST"],
     )
     app.add_api_route("/webhooks/{source}", ingest_handler, methods=["POST"])
