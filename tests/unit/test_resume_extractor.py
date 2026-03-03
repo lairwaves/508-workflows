@@ -1,5 +1,7 @@
 """Unit tests for resume extractor helpers."""
 
+from unittest.mock import Mock, patch
+
 from five08.resume_extractor import _coerce_email_list
 from five08.resume_extractor import ResumeProfileExtractor
 
@@ -58,6 +60,139 @@ def test_extract_profile_links_route_social_urls_away_from_website() -> None:
     assert result.github_username == "wumichaelm"
     assert result.linkedin_url == "https://linkedin.com/in/wumichaelm"
     assert all("node.js" not in link.casefold() for link in result.website_links)
+
+
+def test_split_name_prefers_llm_output() -> None:
+    """Split-name should prefer LLM output when it is available."""
+    extractor = ResumeProfileExtractor(api_key="test-key")
+    extractor.client = Mock()
+
+    with patch.object(
+        extractor,
+        "_split_name_with_llm",
+        return_value=("Ada", "Lovelace"),
+    ) as mock_llm_split:
+        first_name, last_name = extractor.split_name("Ada Lovelace")
+
+    assert first_name == "Ada"
+    assert last_name == "Lovelace"
+    mock_llm_split.assert_called_once_with("Ada Lovelace")
+
+
+def test_split_name_falls_back_to_heuristic_without_name_hints() -> None:
+    """Split-name should still split names using heuristics when LLM fails."""
+    extractor = ResumeProfileExtractor(api_key="test-key")
+    extractor.client = Mock()
+
+    with patch.object(extractor, "_split_name_with_llm", side_effect=RuntimeError()):
+        first_name, last_name = extractor.split_name("Dr. Grace Hopper")
+
+    assert first_name == "Grace"
+    assert last_name == "Hopper"
+
+
+def test_split_name_single_token_returns_unknown_last_name() -> None:
+    """Single token names should use a placeholder last name."""
+    extractor = ResumeProfileExtractor(api_key=None)
+
+    first_name, last_name = extractor.split_name("Cher")
+
+    assert first_name == "Cher"
+    assert last_name == "Unknown"
+
+
+def test_split_name_heuristic_parses_last_comma_first() -> None:
+    """Comma-delimited names should parse as Last, First."""
+    assert ResumeProfileExtractor._split_name_heuristically("Doe, Jane") == (
+        "Jane",
+        "Doe",
+    )
+
+
+def test_split_name_heuristic_preserves_multi_part_first_name_with_last_comma_first() -> (
+    None
+):
+    """Multi-token first names after comma still keep the final last name."""
+    assert ResumeProfileExtractor._split_name_heuristically("Doe, Jane Marie") == (
+        "Jane",
+        "Doe",
+    )
+
+
+def test_split_name_ignores_numeric_last_token() -> None:
+    """Fallback names should avoid non-alpha trailing tokens as last names."""
+    extractor = ResumeProfileExtractor(api_key=None)
+
+    first_name, last_name = extractor.split_name("Person 508")
+
+    assert first_name == "Person"
+    assert last_name == "Unknown"
+
+
+def test_split_name_treats_placeholder_hints_as_missing() -> None:
+    """Placeholder first/last hints should defer to parsed name when available."""
+    extractor = ResumeProfileExtractor(api_key=None)
+
+    first_name, last_name = extractor.split_name(
+        "Ada Lovelace",
+        first_name_hint="Unknown",
+        last_name_hint="N/A",
+    )
+
+    assert first_name == "Ada"
+    assert last_name == "Lovelace"
+
+
+def test_split_name_missing_full_name_uses_default_fallbacks() -> None:
+    """No full name should use the default candidate fallback values."""
+    extractor = ResumeProfileExtractor(api_key=None)
+
+    first_name, last_name = extractor.split_name(None)
+
+    assert first_name == "Resume"
+    assert last_name == "Candidate"
+
+
+def test_split_name_with_llm_partial_last_name_falls_back_to_heuristics() -> None:
+    """Partial LLM output should be completed by heuristic parsing."""
+
+    class _FakeChatCompletions:
+        @staticmethod
+        def create(**_: object) -> object:
+            return type(
+                "Response",
+                (),
+                {
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {
+                                "message": type(
+                                    "Message",
+                                    (),
+                                    {
+                                        "content": '{"firstName": null, "lastName": "Lovelace"}'
+                                    },
+                                )()
+                            },
+                        )()
+                    ]
+                },
+            )()
+
+    extractor = ResumeProfileExtractor(api_key="test-key")
+    extractor.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": _FakeChatCompletions()})()},
+    )()
+    extractor.model = "fake-model"
+
+    first_name, last_name = extractor._split_name_with_llm("Ada Lovelace")
+
+    assert first_name == "Ada"
+    assert last_name == "Lovelace"
 
 
 def test_extract_profile_backfills_website_and_social_urls_from_markdown() -> None:

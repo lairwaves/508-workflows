@@ -51,6 +51,15 @@ EspoAPI = espo.EspoAPI
 EspoAPIError = espo.EspoAPIError
 
 
+def _configured_linkedin_field_from_settings() -> str:
+    value = getattr(settings, "crm_linkedin_field", None)
+    if isinstance(value, str):
+        value = value.strip()
+        if value:
+            return value
+    return "cLinkedInUrl"
+
+
 class ResumeButtonView(discord.ui.View):
     """View containing resume download buttons for contact search results."""
 
@@ -588,7 +597,7 @@ class ResumeUpdateConfirmationView(discord.ui.View):
 
     @classmethod
     def _field_label(cls, field: str) -> str:
-        linkedin_field = getattr(settings, "crm_linkedin_field", "cLinkedInUrl")
+        linkedin_field = _configured_linkedin_field_from_settings()
         if field == linkedin_field:
             return "LinkedIn"
         return cls._FIELD_LABELS.get(field, field)
@@ -1345,6 +1354,10 @@ class ResumeCreateContactView(discord.ui.View):
                 create_payload = self.crm_cog._build_resume_create_contact_payload(
                     file_content=self.file_content
                 )
+            self.crm_cog._populate_name_fields(
+                create_payload,
+                source_name=str(create_payload.get("name", "")).strip(),
+            )
             target_contact = self.crm_cog.espo_api.request(
                 "POST", "Contact", create_payload
             )
@@ -1375,19 +1388,23 @@ class ResumeCreateContactView(discord.ui.View):
             )
         except Exception as exc:
             status_code = getattr(self.crm_cog.espo_api, "status_code", None)
+            error_detail = self.crm_cog._sanitize_error_message_for_discord(exc)
+            status_note = f" (status {status_code})" if status_code else ""
             logger.exception(
-                "Failed to create contact from resume filename=%s target_scope=%s inferred_meta=%s status_code=%s payload=%s",
+                "Failed to create contact from resume filename=%s target_scope=%s inferred_meta=%s "
+                "status_code=%s payload=%s error=%s",
                 self.filename,
                 self.target_scope,
                 self.inferred_contact_meta,
                 status_code,
                 create_payload,
+                error_detail,
             )
             audit_metadata: dict[str, Any] = {
                 "filename": self.filename,
                 "target_scope": self.target_scope,
                 "reason": "contact_create_failed",
-                "error": str(exc),
+                "error": error_detail,
                 "status_code": status_code,
             }
             if create_payload:
@@ -1399,7 +1416,7 @@ class ResumeCreateContactView(discord.ui.View):
                 metadata=audit_metadata,
             )
             await interaction.followup.send(
-                "⚠️ Could not create a contact from this resume. "
+                f"⚠️ Could not create a contact from this resume: `{error_detail}`{status_note}. "
                 "Please provide `search_term` or `link_user`.",
                 ephemeral=True,
             )
@@ -1531,6 +1548,37 @@ class CRMCog(commands.Cog):
             discord_logs_webhook_url=settings.discord_logs_webhook_url,
             discord_logs_webhook_wait=settings.discord_logs_webhook_wait,
         )
+
+    @staticmethod
+    def _configured_linkedin_field() -> str:
+        """Return the configured field for LinkedIn profile values."""
+        return _configured_linkedin_field_from_settings()
+
+    @staticmethod
+    def _sanitize_error_message_for_discord(
+        raw_error: Any,
+        max_length: int = 1900,
+    ) -> str:
+        """Normalize and truncate error text for safe Discord/log output."""
+        text = str(raw_error).strip()
+        if not text:
+            return "Unknown error"
+
+        text = text.replace("`", "'")
+        text = re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]",
+            " ",
+            text,
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if len(text) <= max_length:
+            return text
+
+        if max_length <= 1:
+            return text[:max_length]
+
+        return text[: max_length - 1].rstrip() + "…"
 
     def _audit_command(
         self,
@@ -3280,6 +3328,26 @@ class CRMCog(commands.Cog):
 
         return "\nParsed resume identifiers: " + "; ".join(summary_parts)
 
+    def _build_resume_parsed_identity_summary(self, file_content: bytes) -> str:
+        """Build a short display summary of parsed contact identity fields."""
+        hints = self._extract_resume_contact_hints(file_content)
+        parsed_name = str(hints.get("name") or "").strip()
+        if not parsed_name:
+            parsed_name = self._extract_resume_name_fallback(file_content)
+
+        emails = hints.get("emails", [])
+        if not isinstance(emails, list):
+            emails = []
+        primary_email = "No email parsed"
+        if emails:
+            raw_email = str(emails[0]).strip()
+            if raw_email:
+                primary_email = raw_email
+
+        return (
+            f"\nParsed contact details: name=`{parsed_name}`, email=`{primary_email}`"
+        )
+
     def _extract_resume_name_hint(self, file_content: bytes) -> str:
         """Best-effort contact name extraction from resume text."""
         hints = self._extract_resume_contact_hints(file_content)
@@ -3287,6 +3355,18 @@ class CRMCog(commands.Cog):
         if extracted_name:
             return extracted_name
         return self._extract_resume_name_fallback(file_content)
+
+    def _populate_name_fields(
+        self, payload: dict[str, str], *, source_name: str
+    ) -> None:
+        """Populate firstName and lastName fields for CRM contact creation payloads."""
+        first_name, last_name = self.resume_extractor.split_name(
+            full_name=source_name,
+            first_name_hint=str(payload.get("firstName", "")).strip() or None,
+            last_name_hint=str(payload.get("lastName", "")).strip() or None,
+        )
+        payload["firstName"] = first_name
+        payload["lastName"] = last_name
 
     def _build_resume_create_contact_payload(
         self, file_content: bytes
@@ -3312,6 +3392,7 @@ class CRMCog(commands.Cog):
             "type": "Prospect",
             "name": contact_name,
         }
+        self._populate_name_fields(payload, source_name=contact_name)
         if emails:
             primary_email = emails[0]
             if primary_email.endswith("@508.dev"):
@@ -3321,7 +3402,7 @@ class CRMCog(commands.Cog):
         if github_usernames:
             payload["cGitHubUsername"] = github_usernames[0]
         if linkedin_urls:
-            payload["cLinkedInUrl"] = linkedin_urls[0]
+            payload[self._configured_linkedin_field()] = linkedin_urls[0]
         phone = hints.get("phone")
         if isinstance(phone, str) and phone.strip():
             payload["phoneNumber"] = phone.strip()
@@ -3342,9 +3423,16 @@ class CRMCog(commands.Cog):
 
     def _discord_display_name(self, user: discord.Member) -> str:
         """Format Discord username for CRM fields."""
-        if hasattr(user, "discriminator") and user.discriminator != "0":
-            return f"{user.name}#{user.discriminator}"
-        return str(user.name)
+        username = str(getattr(user, "name", "")).strip()
+        discriminator = getattr(user, "discriminator", "0")
+        if (
+            isinstance(discriminator, str)
+            and discriminator.strip()
+            and discriminator.strip() != "0"
+            and discriminator.strip().isdigit()
+        ):
+            return f"{username}#{discriminator.strip()}"
+        return username
 
     def _discord_link_fields(self, user: discord.Member) -> dict[str, str]:
         """Build CRM fields used to persist Discord linkage."""
@@ -3370,6 +3458,11 @@ class CRMCog(commands.Cog):
         parsed_name = str(payload.get("name", "")).strip()
         if not parsed_name or parsed_name == "Resume Candidate":
             payload["name"] = self._fallback_contact_name_for_discord_user(user)
+            payload.pop("firstName", None)
+            payload.pop("lastName", None)
+        self._populate_name_fields(
+            payload, source_name=str(payload.get("name", "")).strip()
+        )
         payload.update(self._discord_link_fields(user))
         return payload
 
@@ -3377,10 +3470,20 @@ class CRMCog(commands.Cog):
         self, *, field: str, value: str, max_size: int = 10
     ) -> list[dict[str, Any]]:
         """Search contacts using an exact field equals match."""
+        select_fields = [
+            "id",
+            "name",
+            "emailAddress",
+            "c508Email",
+            "cDiscordUsername",
+            "cGitHubUsername",
+        ]
+        if field not in select_fields:
+            select_fields.append(field)
         search_params = {
             "where": [{"type": "equals", "attribute": field, "value": value}],
             "maxSize": max_size,
-            "select": "id,name,emailAddress,c508Email,cDiscordUsername,cGitHubUsername,cLinkedInUrl",
+            "select": ",".join(select_fields),
         }
 
         response = self.espo_api.request("GET", "Contact", search_params)
@@ -3450,7 +3553,7 @@ class CRMCog(commands.Cog):
         for linkedin_url in linkedin_urls:
             attempts.append({"method": "linkedin", "value": linkedin_url})
             contacts = await self._search_contacts_by_field(
-                field="cLinkedInUrl", value=linkedin_url
+                field=self._configured_linkedin_field(), value=linkedin_url
             )
             if len(contacts) == 1:
                 return contacts[0], {
@@ -4948,7 +5051,7 @@ class CRMCog(commands.Cog):
             if linkedin is not None:
                 clean_linkedin = linkedin.strip()
                 if clean_linkedin:
-                    update_data["cLinkedInUrl"] = clean_linkedin
+                    update_data[self._configured_linkedin_field()] = clean_linkedin
                     requested_updates.append("linkedin")
 
             if rate_range is not None:
@@ -5028,9 +5131,10 @@ class CRMCog(commands.Cog):
                             inline=True,
                         )
                     if "linkedin" in requested_updates:
+                        linkedin_field = self._configured_linkedin_field()
                         embed.add_field(
                             name="🔗 LinkedIn",
-                            value=update_data["cLinkedInUrl"],
+                            value=update_data[linkedin_field],
                             inline=True,
                         )
                     if "skills" in requested_updates:
@@ -5605,7 +5709,8 @@ class CRMCog(commands.Cog):
                         await interaction.followup.send(
                             "⚠️ Could not find a unique contact from this resume. "
                             "Would you like to create a new contact from the parsed details?"
-                            + inferred_attempts_text,
+                            + inferred_attempts_text
+                            + self._build_resume_parsed_identity_summary(file_content),
                             view=view,
                             ephemeral=True,
                         )

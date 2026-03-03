@@ -67,6 +67,27 @@ LINKEDIN_PROFILE_PATTERN = re.compile(
     r"(?:https?://)?(?:[\w.-]+\.)?linkedin\.com/in/[A-Za-z0-9_%-]+/?",
     flags=re.IGNORECASE,
 )
+DEFAULT_FALLBACK_FIRST_NAME = "Resume"
+DEFAULT_FALLBACK_LAST_NAME = "Candidate"
+SINGLE_NAME_FALLBACK_LAST_NAME = "Unknown"
+_PLACEHOLDER_NAME_TOKENS = {"unknown", "n/a", "na", "none", "null", "resume candidate"}
+NAME_PREFIXES = {
+    "dr",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "miss",
+    "mx",
+}
+NAME_SUFFIXES = {
+    "jr",
+    "sr",
+    "iii",
+    "ii",
+    "iv",
+    "v",
+}
 
 
 def _bounded_confidence(value: Any, fallback: float) -> float:
@@ -83,6 +104,18 @@ def _normalize_email(value: Any) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized or None
+
+
+def _normalize_name_part(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not any(char.isalpha() for char in normalized):
+        return None
+    return normalized
 
 
 def _coerce_email_list(value: Any) -> list[str]:
@@ -548,6 +581,14 @@ def _normalize_name(value: Any) -> str | None:
     return normalized or None
 
 
+def _is_placeholder_name(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    normalized = value.strip().casefold()
+    return normalized in _PLACEHOLDER_NAME_TOKENS
+
+
 def _parse_json_object(content: str) -> dict[str, Any]:
     raw = content.strip()
     if raw.startswith("```"):
@@ -564,6 +605,8 @@ class ResumeExtractedProfile(BaseModel):
     """Normalized profile fields extracted from resume text."""
 
     name: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     email: str | None = None
     github_username: str | None = None
     linkedin_url: str | None = None
@@ -652,6 +695,18 @@ class ResumeProfileExtractor:
                 raise ValueError("LLM returned empty content")
 
             parsed = _parse_json_object(raw_content)
+            raw_first_name = parsed.get("firstName")
+            if raw_first_name is None:
+                raw_first_name = parsed.get("first_name")
+            raw_last_name = parsed.get("lastName")
+            if raw_last_name is None:
+                raw_last_name = parsed.get("last_name")
+            extracted_name = _normalize_name(parsed.get("name"))
+            extracted_first_name, extracted_last_name = self.split_name(
+                full_name=extracted_name,
+                first_name_hint=raw_first_name,
+                last_name_hint=raw_last_name,
+            )
             parsed_url_candidates = _extract_website_url_candidates(
                 parsed.get("website_url_candidates")
             )
@@ -725,7 +780,9 @@ class ResumeProfileExtractor:
                     if _linkedin_profile_key(item) != linkedin_profile_key
                 ]
             return ResumeExtractedProfile(
-                name=_normalize_name(parsed.get("name")),
+                name=extracted_name,
+                first_name=extracted_first_name,
+                last_name=extracted_last_name,
                 email=parsed_email,
                 additional_emails=parsed_emails,
                 github_username=github_username,
@@ -817,9 +874,12 @@ class ResumeProfileExtractor:
             availability = _normalize_scalar(source_texts.get("rate"))
         rate_range = _normalize_scalar(source_texts.get("rate_range"))
         referred_by = _normalize_scalar(source_texts.get("referred_by"))
+        first_name, last_name = self.split_name(full_name=name_match)
 
         return ResumeExtractedProfile(
             name=name_match,
+            first_name=first_name,
+            last_name=last_name,
             email=extracted_emails[0] if extracted_emails else None,
             additional_emails=extracted_emails[1:],
             github_username=github_username,
@@ -880,7 +940,8 @@ class ResumeProfileExtractor:
         return (
             "Extract candidate profile fields from all provided sources.\n"
             "Return JSON with exact keys and no extras:\n"
-            '{"name": string|null, "email": string|null, "additional_emails": string[]|null, '
+            '{"name": string|null, "firstName": string|null, "lastName": string|null, '
+            '"email": string|null, "additional_emails": string[]|null, '
             '"github_username": string|null, "linkedin_url": string|null, '
             '"website_url_candidates": ['
             '{"url": string|null, "kind": "personal_website|social_profile|other", '
@@ -926,6 +987,170 @@ class ResumeProfileExtractor:
             "- use 'unknown' for unknown or ambiguous fields\n"
             "- confidence is 0-1 for overall extraction reliability\n\n"
             f"Sources:\n{snippet}"
+        )
+
+    def split_name(
+        self,
+        full_name: str | None,
+        *,
+        first_name_hint: str | None = None,
+        last_name_hint: str | None = None,
+    ) -> tuple[str, str]:
+        """Return CRM-safe first/last-name pairs for a profile name."""
+        first_name = _normalize_name_part(first_name_hint)
+        last_name = _normalize_name_part(last_name_hint)
+        if first_name and _is_placeholder_name(first_name):
+            first_name = None
+        if last_name and _is_placeholder_name(last_name):
+            last_name = None
+        normalized_full_name = _normalize_name(full_name)
+        if normalized_full_name and _is_placeholder_name(normalized_full_name):
+            normalized_full_name = None
+
+        if first_name and last_name:
+            return first_name, last_name
+
+        if not normalized_full_name:
+            return (
+                first_name or DEFAULT_FALLBACK_FIRST_NAME,
+                last_name or DEFAULT_FALLBACK_LAST_NAME,
+            )
+
+        inferred_first: str | None = first_name
+        inferred_last: str | None = last_name
+        if normalized_full_name:
+            inferred = None
+            if self.client is not None and not _is_placeholder_name(
+                normalized_full_name
+            ):
+                try:
+                    inferred = self._split_name_with_llm(normalized_full_name)
+                except Exception:
+                    inferred = None
+            if inferred is None:
+                inferred = self._split_name_heuristically(normalized_full_name)
+            if inferred:
+                inferred_first, inferred_last = inferred
+                if not first_name:
+                    first_name = inferred_first
+                if not last_name:
+                    last_name = inferred_last
+
+        return (
+            first_name or DEFAULT_FALLBACK_FIRST_NAME,
+            last_name or inferred_last or SINGLE_NAME_FALLBACK_LAST_NAME,
+        )
+
+    def _split_name_with_llm(self, full_name: str) -> tuple[str, str] | None:
+        """Ask the model to split a display name into first/last."""
+        if self.client is None:
+            return None
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Split person names into firstName and lastName for CRM fields. "
+                        "Return JSON only with no extra keys."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Name: {full_name}. "
+                        'If this is a single name, set lastName to "Unknown".'
+                    ),
+                },
+            ],
+            temperature=0.0,
+            max_tokens=80,
+        )
+        raw_content = response.choices[0].message.content
+        if not raw_content:
+            raise ValueError("LLM returned empty name split content")
+
+        parsed = _parse_json_object(raw_content)
+        split_first = _normalize_name_part(parsed.get("firstName"))
+        split_last = _normalize_name_part(parsed.get("lastName"))
+        split_first = split_first or _normalize_name_part(parsed.get("first_name"))
+        split_last = split_last or _normalize_name_part(parsed.get("last_name"))
+        if split_first and _is_placeholder_name(split_first):
+            split_first = None
+        if split_last and _is_placeholder_name(split_last):
+            split_last = None
+        if not split_first and not split_last:
+            return None
+        if not split_first or not split_last:
+            heuristic_first, heuristic_last = self._split_name_heuristically(full_name)
+            split_first = split_first or heuristic_first
+            split_last = split_last or heuristic_last
+        return (
+            split_first or DEFAULT_FALLBACK_FIRST_NAME,
+            split_last or SINGLE_NAME_FALLBACK_LAST_NAME,
+        )
+
+    @staticmethod
+    def _split_name_heuristically(full_name: str) -> tuple[str, str]:
+        normalized_input = full_name.strip()
+        if not normalized_input:
+            return (
+                DEFAULT_FALLBACK_FIRST_NAME,
+                DEFAULT_FALLBACK_LAST_NAME,
+            )
+
+        comma_left, comma, comma_right = normalized_input.partition(",")
+        if comma and comma_left.strip() and comma_right.strip():
+            full_name = f"{comma_right.strip()} {comma_left.strip()}"
+
+        parts = [
+            token.strip() for token in re.split(r"\s+", full_name) if token.strip()
+        ]
+        if not parts:
+            return (
+                DEFAULT_FALLBACK_FIRST_NAME,
+                DEFAULT_FALLBACK_LAST_NAME,
+            )
+
+        while parts and parts[0].lower().strip(".") in NAME_PREFIXES:
+            parts = parts[1:]
+
+        if not parts:
+            return (
+                DEFAULT_FALLBACK_FIRST_NAME,
+                DEFAULT_FALLBACK_LAST_NAME,
+            )
+
+        if len(parts) == 1:
+            return (
+                parts[0],
+                SINGLE_NAME_FALLBACK_LAST_NAME,
+            )
+
+        if len(parts) >= 2 and parts[-1].lower().strip(".") in NAME_SUFFIXES:
+            last = parts[-2]
+            if len(parts) < 3:
+                return (
+                    parts[0],
+                    SINGLE_NAME_FALLBACK_LAST_NAME,
+                )
+            normalized_last = _normalize_name_part(last)
+            return (
+                parts[0],
+                normalized_last or SINGLE_NAME_FALLBACK_LAST_NAME,
+            )
+
+        last = _normalize_name_part(parts[-1])
+        if not last:
+            return (
+                parts[0],
+                SINGLE_NAME_FALLBACK_LAST_NAME,
+            )
+
+        return (
+            parts[0],
+            last,
         )
 
     @staticmethod
