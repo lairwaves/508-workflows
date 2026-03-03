@@ -6,7 +6,7 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Final
 
 import discord
 import requests
@@ -19,6 +19,25 @@ _WEBHOOK_SUCCESS_COLOR = 0x2ECC71
 _WEBHOOK_ERROR_COLOR = 0xE74C3C
 _WEBHOOK_WARNING_COLOR = 0xF1C40F
 _WEBHOOK_INFO_COLOR = 0x3498DB
+_FAILURE_RESULTS: Final[frozenset[str]] = frozenset(
+    {"error", "failed", "failure", "denied"}
+)
+_SUCCESS_RESULTS: Final[frozenset[str]] = frozenset(
+    {"success", "ok", "created", "queued", "succeeded"}
+)
+_WARNING_RESULTS: Final[frozenset[str]] = frozenset({"retrying", "warning"})
+_NON_MUTATING_COMMAND_ACTIONS: Final[frozenset[str]] = frozenset(
+    {
+        "crm.resume_download_button",
+        "crm.status",
+        "crm.unlinked_discord_users",
+    }
+)
+_NON_MUTATING_COMMAND_PREFIXES: Final[tuple[str, ...]] = (
+    "crm.get_",
+    "crm.search_",
+    "crm.view_",
+)
 
 
 class DiscordAuditLogger:
@@ -65,6 +84,8 @@ class DiscordAuditLogger:
         """Queue a best-effort audit write in the background."""
         if not (self.enabled or self.webhook_enabled):
             return
+        if not self._should_log_command_event(action=action, result=result):
+            return
 
         event_payload = self._build_discord_payload(
             interaction=interaction,
@@ -76,6 +97,29 @@ class DiscordAuditLogger:
         )
 
         self._queue_event(event_payload)
+
+    @staticmethod
+    def _is_failure_result(result: str) -> bool:
+        """Return True when command result should always be audited."""
+        return result.strip().lower() in _FAILURE_RESULTS
+
+    @staticmethod
+    def _is_non_mutating_action(action: str) -> bool:
+        """Return True when the command action is treated as non-mutating."""
+        normalized_action = action.strip().lower()
+        if normalized_action in _NON_MUTATING_COMMAND_ACTIONS:
+            return True
+        return any(
+            normalized_action.startswith(prefix)
+            for prefix in _NON_MUTATING_COMMAND_PREFIXES
+        )
+
+    @staticmethod
+    def _should_log_command_event(*, action: str, result: str) -> bool:
+        """Return whether a command event should be emitted."""
+        if DiscordAuditLogger._is_failure_result(result):
+            return True
+        return not DiscordAuditLogger._is_non_mutating_action(action)
 
     def log_admin_sso_action(
         self,
@@ -185,9 +229,9 @@ class DiscordAuditLogger:
     @staticmethod
     def _result_emoji(result: str) -> str:
         normalized = result.strip().lower()
-        if normalized in {"success", "ok", "created", "queued"}:
+        if normalized in _SUCCESS_RESULTS:
             return "✅"
-        if normalized in {"error", "failed", "failure", "denied"}:
+        if normalized in _FAILURE_RESULTS:
             return "❌"
         return "ℹ️"
 
@@ -200,11 +244,11 @@ class DiscordAuditLogger:
     @staticmethod
     def _webhook_color(result: str) -> int:
         normalized = result.strip().lower()
-        if normalized in {"success", "ok", "created", "queued", "succeeded"}:
+        if normalized in _SUCCESS_RESULTS:
             return _WEBHOOK_SUCCESS_COLOR
-        if normalized in {"error", "failed", "failure", "denied"}:
+        if normalized in _FAILURE_RESULTS:
             return _WEBHOOK_ERROR_COLOR
-        if normalized in {"retrying", "warning"}:
+        if normalized in _WARNING_RESULTS:
             return _WEBHOOK_WARNING_COLOR
         return _WEBHOOK_INFO_COLOR
 
