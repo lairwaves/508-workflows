@@ -233,6 +233,24 @@ class TestCRMCog:
         assert where_filters[1]["attribute"] == "skills"
         assert where_filters[1]["value"] == ["python", "sql"]
 
+    @pytest.mark.asyncio
+    async def test_search_contacts_skills_query_normalizes_to_lowercase(
+        self, crm_cog, mock_interaction, mock_member_role
+    ):
+        """Skill-only search should normalize incoming terms before arrayAllOf filtering."""
+        mock_interaction.user.roles = [mock_member_role]
+        crm_cog.espo_api.request.return_value = {"list": []}
+
+        await crm_cog.search_members.callback(
+            crm_cog, mock_interaction, None, "Python, FastAPI "
+        )
+
+        crm_cog.espo_api.request.assert_called_once()
+        call_args = crm_cog.espo_api.request.call_args
+        search_params = call_args[0][2]
+        assert search_params["where"][0]["type"] == "arrayAllOf"
+        assert search_params["where"][0]["value"] == ["python", "fastapi"]
+
     def test_parse_contact_skill_attrs_recovers_python_literal(self, crm_cog):
         """Malformed JSON-like skill attrs should recover via literal parsing."""
         parsed = crm_cog._parse_contact_skill_attrs(
@@ -931,19 +949,25 @@ class TestCRMCog:
         search_params = call_args[0][2]  # Third argument is the search params
         # Check that it searched for "john" as a name
         first_where = search_params["where"][0]
-        if first_where.get("type") == "or":
-            where_filters = first_where.get("value", [])
+        if first_where.get("type") == "or" and isinstance(
+            first_where.get("value"), list
+        ):
+            where_filters = first_where["value"]
             assert isinstance(where_filters, list)
             where_filter = next(
-                (item for item in where_filters if item.get("attribute") == "name"),
+                (
+                    item
+                    for item in where_filters
+                    if isinstance(item, dict) and item.get("attribute") == "name"
+                ),
                 None,
             )
             assert where_filter is not None
-            assert where_filter["value"] == "john"
+            assert where_filter.get("value") == "john"
             return
 
-        assert first_where["attribute"] == "name"
-        assert first_where["value"] == "john"
+        assert first_where.get("attribute") == "name"
+        assert first_where.get("value") == "john"
 
     @pytest.mark.asyncio
     async def test_link_discord_user_modern_username(

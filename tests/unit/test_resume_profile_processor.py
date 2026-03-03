@@ -1,5 +1,8 @@
 """Unit tests for resume profile worker processor."""
 
+import json
+from datetime import datetime
+
 from unittest.mock import Mock
 
 from five08.worker.crm.resume_profile_processor import ResumeProfileProcessor
@@ -14,6 +17,9 @@ def test_extract_profile_proposal_filters_508_email() -> None:
     processor.skills_extractor = Mock()
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
 
     processor.crm.get_contact.return_value = {
         "emailAddress": "member@example.com",
@@ -53,18 +59,350 @@ def test_extract_profile_proposal_filters_508_email() -> None:
     assert result.proposed_updates["cGitHubUsername"] == "new-gh"
     assert result.proposed_updates["cLinkedInUrl"] == "https://linkedin.com/in/new"
     assert result.proposed_updates["phoneNumber"] == "14155551234"
-    assert result.proposed_updates["skills"] == ["Python", "FastAPI"]
-    assert result.new_skills == ["Python", "FastAPI"]
+    assert result.proposed_updates["skills"] == ["python", "fastapi"]
+    assert result.new_skills == ["python", "fastapi"]
+    assert isinstance(result.proposed_updates["cSkillAttrs"], str)
+    assert json.loads(result.proposed_updates["cSkillAttrs"])["python"]["strength"] == 5
+    assert (
+        json.loads(result.proposed_updates["cSkillAttrs"])["fastapi"]["strength"] == 4
+    )
     assert any(item.field == "emailAddress" for item in result.skipped)
     processor.crm.update_contact.assert_called_once()
     update_contact_payload = processor.crm.update_contact.call_args.args[1]
     assert "cResumeLastProcessed" in update_contact_payload
     assert isinstance(update_contact_payload["cResumeLastProcessed"], str)
+    assert (
+        datetime.strptime(
+            update_contact_payload["cResumeLastProcessed"], "%Y-%m-%d %H:%M:%S"
+        )
+        is not None
+    )
     processor._record_processing_run.assert_called_once()
     record_kwargs = processor._record_processing_run.call_args.kwargs
     assert record_kwargs["status"] == "succeeded"
     assert record_kwargs["contact_id"] == "contact-1"
     assert record_kwargs["attachment_id"] == "att-1"
+
+
+def test_extract_profile_proposal_merges_and_serializes_website_and_skill_attrs() -> (
+    None
+):
+    """Proposal should merge website links and serialize cSkillAttrs as JSON."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.extractor = Mock()
+    processor.skills_extractor = Mock()
+    processor.document_processor = Mock()
+    processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
+
+    processor.crm.get_contact.return_value = {
+        "emailAddress": "member@example.com",
+        "cWebsiteLink": ["https://portfolio.example.com"],
+    }
+    processor.crm.download_attachment.return_value = b"resume-bytes"
+    processor.document_processor.extract_text.return_value = "resume text"
+    processor.document_processor.get_content_hash.return_value = "hash-2"
+    processor.extractor.extract.return_value = ResumeExtractedProfile(
+        email="new@example.com",
+        github_username=None,
+        linkedin_url=None,
+        phone=None,
+        website_links=["https://portfolio.example.com", "https://www.blog.example.com"],
+        confidence=0.9,
+        source="gpt-4o-mini",
+    )
+    processor.skills_extractor.extract_skills.return_value = ExtractedSkills(
+        skills=["TypeScript", "React Native"],
+        skill_attrs={"typescript": {"strength": 4}, "react native": {"strength": 3}},
+        confidence=0.8,
+        source="gpt-4o-mini",
+    )
+
+    result = processor.extract_profile_proposal(
+        contact_id="contact-2",
+        attachment_id="att-2",
+        filename="resume.pdf",
+    )
+
+    assert result.success is True
+    assert result.proposed_updates["cWebsiteLink"] == [
+        "https://portfolio.example.com",
+        "https://blog.example.com",
+    ]
+    assert result.proposed_updates["skills"] == ["typescript", "react native"]
+    assert isinstance(result.proposed_updates["cSkillAttrs"], str)
+    assert json.loads(result.proposed_updates["cSkillAttrs"]) == {
+        "react native": {"strength": 3},
+        "typescript": {"strength": 4},
+    }
+
+
+def test_extract_profile_proposal_merges_and_serializes_social_links() -> None:
+    """Social links should be merged and persisted to cSocialLinks without duplication."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.extractor = Mock()
+    processor.skills_extractor = Mock()
+    processor.document_processor = Mock()
+    processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
+
+    processor.crm.get_contact.return_value = {
+        "emailAddress": "member@example.com",
+        "cWebsiteLink": ["https://portfolio.example.com"],
+        "cSocialLinks": ["https://x.com/old"],
+    }
+    processor.crm.download_attachment.return_value = b"resume-bytes"
+    processor.document_processor.extract_text.return_value = "resume text"
+    processor.document_processor.get_content_hash.return_value = "hash-social"
+    processor.extractor.extract.return_value = ResumeExtractedProfile(
+        email="new@example.com",
+        github_username=None,
+        linkedin_url=None,
+        phone=None,
+        website_links=["https://portfolio.example.com", "https://blog.example.com"],
+        social_links=["https://x.com/new", "https://instagram.com/example"],
+        confidence=0.9,
+        source="gpt-4o-mini",
+    )
+    processor.skills_extractor.extract_skills.return_value = ExtractedSkills(
+        skills=[],
+        skill_attrs={},
+        confidence=0.8,
+        source="gpt-4o-mini",
+    )
+
+    result = processor.extract_profile_proposal(
+        contact_id="contact-social",
+        attachment_id="att-social",
+        filename="resume.pdf",
+    )
+
+    assert result.success is True
+    assert result.proposed_updates["cSocialLinks"] == [
+        "https://x.com/old",
+        "https://x.com/new",
+        "https://instagram.com/example",
+    ]
+
+
+def test_extract_profile_proposal_deduplicates_skills_in_confirmation() -> None:
+    """Duplicate extracted or existing skills should not appear in confirmation updates."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.extractor = Mock()
+    processor.skills_extractor = Mock()
+    processor.document_processor = Mock()
+    processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
+
+    processor.crm.get_contact.return_value = {
+        "emailAddress": "member@example.com",
+        "skills": ["Python", "python", "JavaScript", "javascript"],
+        "cSkillAttrs": '{"python":{"strength":5},"javascript":{"strength":4}}',
+    }
+    processor.crm.download_attachment.return_value = b"resume-bytes"
+    processor.document_processor.extract_text.return_value = "resume text"
+    processor.document_processor.get_content_hash.return_value = "hash-3"
+    processor.extractor.extract.return_value = ResumeExtractedProfile(
+        email=None,
+        github_username=None,
+        linkedin_url=None,
+        phone=None,
+        confidence=0.9,
+        source="gpt-4o-mini",
+    )
+    processor.skills_extractor.extract_skills.return_value = ExtractedSkills(
+        skills=["Python", "node", "Node.js", "python"],
+        skill_attrs={"python": {"strength": 5}, "node": {"strength": 2}},
+        confidence=0.8,
+        source="gpt-4o-mini",
+    )
+
+    result = processor.extract_profile_proposal(
+        contact_id="contact-3",
+        attachment_id="att-3",
+        filename="resume.pdf",
+    )
+
+    assert result.success is True
+    assert result.proposed_updates["skills"] == ["python", "javascript", "node"]
+    assert result.new_skills == ["node"]
+
+
+def test_extract_profile_proposal_includes_seniority_update() -> None:
+    """Extracted seniority should map to the CRM cSeniority field."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.extractor = Mock()
+    processor.skills_extractor = Mock()
+    processor.document_processor = Mock()
+    processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
+
+    processor.crm.get_contact.return_value = {
+        "emailAddress": "member@example.com",
+        "cSeniority": "junior",
+    }
+    processor.crm.download_attachment.return_value = b"resume-bytes"
+    processor.document_processor.extract_text.return_value = "resume text"
+    processor.document_processor.get_content_hash.return_value = "hash-4"
+    processor.extractor.extract.return_value = ResumeExtractedProfile(
+        email=None,
+        github_username=None,
+        linkedin_url=None,
+        phone=None,
+        seniority_level="Senior",
+        confidence=0.9,
+        source="gpt-4o-mini",
+    )
+    processor.skills_extractor.extract_skills.return_value = ExtractedSkills(
+        skills=[],
+        skill_attrs={},
+        confidence=0.8,
+        source="gpt-4o-mini",
+    )
+
+    result = processor.extract_profile_proposal(
+        contact_id="contact-4",
+        attachment_id="att-4",
+        filename="resume.pdf",
+    )
+
+    assert result.success is True
+    assert result.proposed_updates["cSeniority"] == "senior"
+
+
+def test_extract_profile_proposal_maps_principal_to_staff() -> None:
+    """Principal titles should normalize to staff seniority."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.extractor = Mock()
+    processor.skills_extractor = Mock()
+    processor.document_processor = Mock()
+    processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
+
+    processor.crm.get_contact.return_value = {"emailAddress": "member@example.com"}
+    processor.crm.download_attachment.return_value = b"resume-bytes"
+    processor.document_processor.extract_text.return_value = "resume text"
+    processor.document_processor.get_content_hash.return_value = "hash-9"
+    processor.extractor.extract.return_value = ResumeExtractedProfile(
+        email=None,
+        github_username=None,
+        linkedin_url=None,
+        phone=None,
+        seniority_level="Principal Engineer",
+        confidence=0.9,
+        source="gpt-4o-mini",
+    )
+    processor.skills_extractor.extract_skills.return_value = ExtractedSkills(
+        skills=[],
+        skill_attrs={},
+        confidence=0.8,
+        source="gpt-4o-mini",
+    )
+
+    result = processor.extract_profile_proposal(
+        contact_id="contact-9",
+        attachment_id="att-9",
+        filename="resume.pdf",
+    )
+
+    assert result.success is True
+    assert result.proposed_updates["cSeniority"] == "staff"
+
+
+def test_extract_profile_proposal_normalizes_unknown_seniority_to_unknown() -> None:
+    """Unknown extracted seniority values should normalize to unknown."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.extractor = Mock()
+    processor.skills_extractor = Mock()
+    processor.document_processor = Mock()
+    processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
+
+    processor.crm.get_contact.return_value = {
+        "emailAddress": "member@example.com",
+    }
+    processor.crm.download_attachment.return_value = b"resume-bytes"
+    processor.document_processor.extract_text.return_value = "resume text"
+    processor.document_processor.get_content_hash.return_value = "hash-5"
+    processor.extractor.extract.return_value = ResumeExtractedProfile(
+        email=None,
+        github_username=None,
+        linkedin_url=None,
+        phone=None,
+        seniority_level="guru",
+        confidence=0.9,
+        source="gpt-4o-mini",
+    )
+    processor.skills_extractor.extract_skills.return_value = ExtractedSkills(
+        skills=[],
+        skill_attrs={},
+        confidence=0.8,
+        source="gpt-4o-mini",
+    )
+
+    result = processor.extract_profile_proposal(
+        contact_id="contact-8",
+        attachment_id="att-8",
+        filename="resume.pdf",
+    )
+
+    assert result.success is True
+    assert result.proposed_updates["cSeniority"] == "unknown"
+
+
+def test_apply_profile_updates_appends_resume_email_as_primary_emailAddressData() -> (
+    None
+):
+    """Resume email updates should append to emailAddressData instead of overwriting."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+    processor.crm.get_contact.return_value = {
+        "emailAddressData": [
+            {
+                "emailAddress": "legacy@example.com",
+                "lower": "legacy@example.com",
+                "primary": True,
+                "optOut": False,
+                "invalid": False,
+            }
+        ]
+    }
+    result = processor.apply_profile_updates(
+        contact_id="contact-3",
+        updates={
+            "emailAddress": "NewPerson@Example.Com",
+            "phoneNumber": "5551112222",
+        },
+    )
+
+    assert result.success is True
+    processor.crm.update_contact.assert_called_once()
+    payload = processor.crm.update_contact.call_args[0][1]
+    assert "emailAddress" not in payload
+    email_data = payload["emailAddressData"]
+    assert isinstance(email_data, list)
+    by_lower = {item["lower"]: item for item in email_data}
+    assert by_lower["newperson@example.com"]["primary"] is True
+    assert by_lower["legacy@example.com"]["primary"] is False
+    assert payload["phoneNumber"] == "5551112222"
 
 
 def test_extract_profile_proposal_normalizes_existing_skill_punctuation() -> None:
@@ -75,6 +413,9 @@ def test_extract_profile_proposal_normalizes_existing_skill_punctuation() -> Non
     processor.skills_extractor = Mock()
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
 
     processor.crm.get_contact.return_value = {
         "emailAddress": "member@example.com",
@@ -131,6 +472,9 @@ def test_extract_profile_proposal_with_strength_change_only_no_skill_proposal() 
     processor.skills_extractor = Mock()
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
+    processor.skills_extractor.canonicalize_skill.side_effect = lambda v: (
+        str(v).strip().lower()
+    )
 
     processor.crm.get_contact.return_value = {
         "emailAddress": "member@example.com",
@@ -191,27 +535,96 @@ def test_apply_profile_updates_adds_discord_and_filters_email() -> None:
     assert "emailAddress" not in update_payload
     assert update_payload["cGitHubUsername"] == "new-gh"
     assert update_payload["phoneNumber"] == "14155551234"
-    assert update_payload["skills"] == ["Python", "FastAPI"]
+    assert update_payload["skills"] == ["python", "fastapi"]
     assert update_payload["cDiscordUserID"] == "123"
     assert update_payload["cDiscordUsername"] == "member#0001 (ID: 123)"
 
 
-def test_apply_profile_updates_normalizes_csv_skills_string_to_array() -> None:
-    """Apply should normalize comma-separated skill strings into array payloads."""
+def test_apply_profile_updates_normalizes_csv_skills_to_array() -> None:
+    """Apply should convert comma-separated skills into a deduplicated array."""
     processor = ResumeProfileProcessor()
     processor.crm = Mock()
 
     result = processor.apply_profile_updates(
         contact_id="contact-2",
-        updates={
-            "skills": "Python, FastAPI, React, ,JavaScript",
-        },
+        updates={"skills": "Python, FastAPI, Rust"},
     )
 
     assert result.success is True
     processor.crm.update_contact.assert_called_once()
-    update_payload = processor.crm.update_contact.call_args.args[1]
-    assert update_payload["skills"] == ["Python", "FastAPI", "React", "JavaScript"]
+    update_payload = processor.crm.update_contact.call_args[0][1]
+    assert update_payload["skills"] == ["python", "fastapi", "rust"]
+
+
+def test_apply_profile_updates_serializes_skill_attrs() -> None:
+    """Apply should serialize cSkillAttrs payload as compact JSON."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+
+    result = processor.apply_profile_updates(
+        contact_id="contact-4",
+        updates={
+            "cSkillAttrs": {"python": {"strength": 5}, "react": {"strength": 3}},
+            "skills": "Python",
+        },
+    )
+
+    assert result.success is True
+    payload = processor.crm.update_contact.call_args[0][1]
+    assert payload["skills"] == ["python"]
+    assert json.loads(payload["cSkillAttrs"]) == {
+        "python": {"strength": 5},
+        "react": {"strength": 3},
+    }
+
+
+def test_apply_profile_updates_allows_cSeniority_field() -> None:
+    """Allowed updates should include cSeniority normalization."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+
+    result = processor.apply_profile_updates(
+        contact_id="contact-5",
+        updates={"cSeniority": "Senior"},
+    )
+
+    assert result.success is True
+    payload = processor.crm.update_contact.call_args[0][1]
+    assert payload["cSeniority"] == "senior"
+
+
+def test_apply_profile_updates_normalizes_unknown_seniority_to_unknown() -> None:
+    """Unknown seniority values should be normalized to the canonical unknown bucket."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+
+    result = processor.apply_profile_updates(
+        contact_id="contact-7",
+        updates={"cSeniority": "distinguished"},
+    )
+
+    assert result.success is True
+    payload = processor.crm.update_contact.call_args[0][1]
+    assert payload["cSeniority"] == "unknown"
+
+
+def test_apply_profile_updates_normalizes_skill_aliases_for_api_payload() -> None:
+    """Alias-heavy skills should be normalized into shared canonical forms."""
+    processor = ResumeProfileProcessor()
+    processor.crm = Mock()
+
+    result = processor.apply_profile_updates(
+        contact_id="contact-6",
+        updates={
+            "skills": ["Node.js", "Node.js", "node"],
+            "cSkillAttrs": {"Node.js": {"strength": 4}, "node": {"strength": 5}},
+        },
+    )
+
+    assert result.success is True
+    payload = processor.crm.update_contact.call_args[0][1]
+    assert payload["skills"] == ["node"]
+    assert json.loads(payload["cSkillAttrs"]) == {"node": {"strength": 5}}
 
 
 def test_extract_profile_proposal_records_failed_run() -> None:
