@@ -29,6 +29,8 @@ _CREATE_PEOPLE_TABLE = """
         name               TEXT,
         email              TEXT,
         email_508          TEXT,
+        discord_user_id    TEXT,
+        discord_username   TEXT,
         linkedin           TEXT,
         latest_resume_id   TEXT,
         latest_resume_name TEXT,
@@ -38,10 +40,21 @@ _CREATE_PEOPLE_TABLE = """
         address_country    TEXT,
         timezone           TEXT,
         skills             TEXT[]      NOT NULL DEFAULT '{}',
-        skill_attrs        JSONB       NOT NULL DEFAULT '{}'
+        skill_attrs        JSONB       NOT NULL DEFAULT '{}',
+        discord_roles      JSONB       NOT NULL DEFAULT '[]'
     )
 """
 
+_CREATE_DISCORD_MEMBERS_TABLE = """
+    CREATE TABLE IF NOT EXISTS discord_members (
+        guild_id           TEXT        NOT NULL,
+        discord_user_id    TEXT        NOT NULL,
+        discord_username   TEXT,
+        display_name       TEXT,
+        roles              JSONB       NOT NULL DEFAULT '[]',
+        PRIMARY KEY (guild_id, discord_user_id)
+    )
+"""
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -61,11 +74,21 @@ def pg_settings() -> SharedSettings:
 
     with connect(_POSTGRES_TEST_URL) as conn:
         conn.execute(_CREATE_PEOPLE_TABLE)
+        conn.execute(
+            "ALTER TABLE people "
+            "ADD COLUMN IF NOT EXISTS discord_roles JSONB NOT NULL DEFAULT '[]'"
+        )
+        conn.execute("ALTER TABLE people ADD COLUMN IF NOT EXISTS discord_user_id TEXT")
+        conn.execute(
+            "ALTER TABLE people ADD COLUMN IF NOT EXISTS discord_username TEXT"
+        )
+        conn.execute(_CREATE_DISCORD_MEMBERS_TABLE)
 
     settings = SharedSettings(postgres_url=_POSTGRES_TEST_URL, environment="test")
     yield settings
 
     with connect(_POSTGRES_TEST_URL) as conn:
+        conn.execute("DROP TABLE IF EXISTS discord_members")
         conn.execute("DROP TABLE IF EXISTS people")
 
 
@@ -74,6 +97,7 @@ def pg_db(pg_settings: SharedSettings) -> SharedSettings:
     """Function-scoped: truncate people for test isolation, return settings."""
     with connect(_POSTGRES_TEST_URL) as conn:
         conn.execute("TRUNCATE TABLE people")
+        conn.execute("TRUNCATE TABLE discord_members")
     return pg_settings
 
 
@@ -88,6 +112,8 @@ def _insert(
     name: str = "Test Person",
     email: str | None = None,
     email_508: str | None = None,
+    discord_user_id: str | None = None,
+    discord_username: str | None = None,
     is_member: bool = False,
     sync_status: str = "active",
     seniority: str | None = None,
@@ -95,21 +121,25 @@ def _insert(
     timezone: str | None = None,
     skills: list[str] | None = None,
     skill_attrs: dict | None = None,
+    discord_roles: list[str] | None = None,
 ) -> None:
     with connect(_POSTGRES_TEST_URL) as conn:
         conn.execute(
             """
             INSERT INTO people (
                 crm_contact_id, name, email, email_508,
+                discord_user_id, discord_username,
                 is_member, sync_status, seniority,
-                address_country, timezone, skills, skill_attrs
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                address_country, timezone, skills, skill_attrs, discord_roles
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 crm_contact_id,
                 name,
                 email,
                 email_508,
+                discord_user_id,
+                discord_username,
                 is_member,
                 sync_status,
                 seniority,
@@ -117,6 +147,32 @@ def _insert(
                 timezone,
                 skills or [],
                 Jsonb(skill_attrs or {}),
+                Jsonb(discord_roles or []),
+            ),
+        )
+
+
+def _insert_discord_member(
+    *,
+    discord_user_id: str,
+    guild_id: str = "guild-1",
+    discord_username: str | None = None,
+    display_name: str | None = None,
+    roles: list[str] | None = None,
+) -> None:
+    with connect(_POSTGRES_TEST_URL) as conn:
+        conn.execute(
+            """
+            INSERT INTO discord_members (
+                discord_user_id, guild_id, discord_username, display_name, roles
+            ) VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                discord_user_id,
+                guild_id,
+                discord_username,
+                display_name,
+                Jsonb(roles or []),
             ),
         )
 
@@ -125,6 +181,7 @@ def _reqs(**overrides) -> JobRequirements:
     defaults: dict = dict(
         required_skills=["python"],
         preferred_skills=[],
+        discord_role_types=[],
         seniority=None,
         location_type=None,
         preferred_timezones=[],
@@ -288,3 +345,30 @@ class TestSearchCandidatesE2E:
         results = search_candidates(pg_db, _reqs(required_skills=["python"]))
 
         assert results == []
+
+    def test_discord_role_match_includes_candidate(self, pg_db: SharedSettings) -> None:
+        _insert(crm_contact_id="backend", discord_user_id="111")
+        _insert(crm_contact_id="frontend", discord_user_id="222")
+        _insert_discord_member(discord_user_id="111", roles=["Backend"])
+        _insert_discord_member(discord_user_id="222", roles=["Frontend"])
+
+        results = search_candidates(
+            pg_db, _reqs(required_skills=[], discord_role_types=["Backend"])
+        )
+
+        assert len(results) == 1
+        assert results[0].crm_contact_id == "backend"
+        assert results[0].matched_discord_roles == ["Backend"]
+
+    def test_discord_role_match_includes_unlinked_member(
+        self, pg_db: SharedSettings
+    ) -> None:
+        _insert_discord_member(discord_user_id="333", roles=["Backend"])
+
+        results = search_candidates(
+            pg_db, _reqs(required_skills=[], discord_role_types=["Backend"])
+        )
+
+        assert len(results) == 1
+        assert results[0].discord_user_id == "333"
+        assert results[0].has_crm_link is False

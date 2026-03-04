@@ -35,7 +35,7 @@ from five08.discord_bot.utils.role_decorators import (
 )
 from five08.job_match import extract_job_requirements, DISCORD_ROLES_EXCLUDE_FROM_SYNC
 from five08.candidate_search import search_candidates
-from five08.audit import update_person_discord_roles
+from five08.audit import update_person_discord_roles, upsert_discord_member
 
 logger = logging.getLogger(__name__)
 
@@ -6340,8 +6340,17 @@ class CRMCog(commands.Cog):
             label = "**[Member]**" if c.is_member else "[Prospect]"
             name = c.name or "Unknown"
             email = c.email_508 or c.email or "—"
-            crm_link = f"{crm_base}/#Contact/view/{c.crm_contact_id}"
-            parts = [f"{i}. {label} {name} · [{email}](<{crm_link}>)"]
+            crm_link = (
+                f"{crm_base}/#Contact/view/{c.crm_contact_id}"
+                if c.has_crm_link and c.crm_contact_id
+                else None
+            )
+            if crm_link:
+                parts = [f"{i}. {label} {name} · [{email}](<{crm_link}>)"]
+            else:
+                parts = [f"{i}. {label} {name} · {email}"]
+                if c.discord_user_id:
+                    parts.append(f"Discord: <@{c.discord_user_id}>")
 
             if c.linkedin:
                 parts.append(f"[LinkedIn](<{c.linkedin}>)")
@@ -6417,6 +6426,15 @@ class CRMCog(commands.Cog):
                 if r.name not in DISCORD_ROLES_EXCLUDE_FROM_SYNC
             ]
             try:
+                await asyncio.to_thread(
+                    upsert_discord_member,
+                    settings,
+                    discord_user_id=str(member.id),
+                    guild_id=str(guild.id),
+                    discord_username=member.name,
+                    display_name=member.display_name,
+                    roles=role_names,
+                )
                 did_update = await asyncio.to_thread(
                     update_person_discord_roles,
                     settings,
@@ -6502,11 +6520,23 @@ class CRMCog(commands.Cog):
         if before.roles == after.roles:
             return
 
+        if after.guild is None:
+            return
+
         role_names = [
             r.name for r in after.roles if r.name not in DISCORD_ROLES_EXCLUDE_FROM_SYNC
         ]
 
         try:
+            await asyncio.to_thread(
+                upsert_discord_member,
+                settings,
+                discord_user_id=str(after.id),
+                guild_id=str(after.guild.id),
+                discord_username=after.name,
+                display_name=after.display_name,
+                roles=role_names,
+            )
             await asyncio.to_thread(
                 update_person_discord_roles,
                 settings,
