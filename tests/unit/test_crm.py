@@ -534,6 +534,178 @@ class TestCRMCog:
             "❌ Failed to download resume: API Error"
         )
 
+    def test_role_id_cache_initializes_empty(self, crm_cog):
+        """Role ID cache should initialize empty on first access."""
+        cache = crm_cog._get_role_id_cache()
+
+        assert cache == {}
+
+    def test_refresh_role_id_cache_builds_casefold_map(self, crm_cog):
+        """Role ID cache should map casefolded role names to IDs."""
+        role_frontend = Mock()
+        role_frontend.name = "Frontend"
+        role_frontend.id = 111
+        role_frontend.position = 3
+
+        role_full_stack = Mock()
+        role_full_stack.name = "Full Stack"
+        role_full_stack.id = 222
+        role_full_stack.position = 2
+
+        role_excluded = Mock()
+        role_excluded.name = "Bots"
+        role_excluded.id = 333
+        role_excluded.position = 1
+
+        guild = Mock()
+        guild.id = 42
+        guild.roles = [role_frontend, role_full_stack, role_excluded]
+
+        with patch(
+            "five08.discord_bot.cogs.crm.DISCORD_ROLES_EXCLUDE_FROM_SYNC",
+            {"Bots"},
+        ):
+            crm_cog._refresh_role_id_cache(guild)
+
+        cache = crm_cog._get_role_id_cache()
+        assert cache[42] == {"frontend": 111, "full stack": 222}
+
+    @pytest.mark.asyncio
+    async def test_on_guild_role_update_refreshes_cache(self, crm_cog):
+        """Role update events should refresh the role ID cache."""
+        guild = Mock()
+        before = Mock()
+        before.guild = guild
+        after = Mock()
+        after.guild = guild
+
+        with patch.object(crm_cog, "_refresh_role_id_cache") as refresh:
+            await crm_cog.on_guild_role_update(before, after)
+
+        refresh.assert_called_once_with(guild)
+
+    @pytest.mark.asyncio
+    async def test_match_candidates_sends_role_and_locality_mentions(
+        self, crm_cog, mock_interaction, mock_member_role
+    ):
+        """Match candidates should emit role/locality mention lines safely."""
+        role_frontend = Mock()
+        role_frontend.name = "Frontend"
+        role_frontend.id = 111
+        role_frontend.position = 3
+
+        role_usa = Mock()
+        role_usa.name = "USA"
+        role_usa.id = 222
+        role_usa.position = 2
+
+        guild = Mock()
+        guild.id = 55
+        guild.roles = [role_frontend, role_usa]
+
+        mock_interaction.guild = guild
+        mock_interaction.user.id = 999
+        mock_interaction.user.name = "Requester"
+        mock_interaction.user.roles = [mock_member_role]
+
+        starter_msg = Mock()
+        starter_msg.content = "Example job"
+        starter_msg.attachments = []
+        starter_msg.embeds = []
+
+        class DummyThread:
+            id = 123
+            applied_tags = []
+
+        thread_instance = DummyThread()
+        thread_instance.starter_message = starter_msg
+        mock_interaction.channel = thread_instance
+
+        requirements = Mock()
+        requirements.title = "Frontend Engineer"
+        requirements.discord_role_types = [" Frontend ", "Senior"]
+        requirements.raw_location_text = "USA"
+        requirements.preferred_timezones = []
+        requirements.location_type = "us_only"
+        requirements.required_skills = ["python"]
+        requirements.preferred_skills = []
+        requirements.seniority = "Senior"
+
+        candidate = Mock()
+        candidate.is_member = True
+        candidate.name = "Alice"
+        candidate.email_508 = "alice@508.dev"
+        candidate.email = None
+        candidate.crm_contact_id = None
+        candidate.has_crm_link = False
+        candidate.discord_user_id = 12345
+        candidate.linkedin = None
+        candidate.latest_resume_id = None
+        candidate.latest_resume_name = None
+        candidate.match_score = 9.2
+        candidate.matched_required_skills = ["python"]
+        candidate.matched_discord_roles = ["Frontend"]
+        candidate.seniority = "Senior"
+        candidate.timezone = "America/New_York"
+
+        crm_cog._refresh_role_id_cache(guild)
+
+        with (
+            patch(
+                "five08.discord_bot.cogs.crm.extract_job_requirements",
+                return_value=requirements,
+            ),
+            patch(
+                "five08.discord_bot.cogs.crm.search_candidates",
+                return_value=[candidate],
+            ),
+            patch(
+                "five08.discord_bot.cogs.crm.settings.espo_base_url",
+                "https://crm.example.com",
+            ),
+            patch("five08.discord_bot.cogs.crm.discord.Thread", DummyThread),
+            patch.object(crm_cog, "_audit_command"),
+        ):
+            await crm_cog.match_candidates.callback(crm_cog, mock_interaction)
+
+        def assert_mentions_disabled(call):
+            allowed = call.kwargs["allowed_mentions"]
+            assert allowed.roles is False
+            assert allowed.users is False
+            assert allowed.everyone is False
+
+        calls = mock_interaction.followup.send.call_args_list
+        header_call = calls[0]
+        assert header_call.args[0].startswith("## Job Match Results")
+        assert_mentions_disabled(header_call)
+
+        role_call = next(
+            call
+            for call in calls
+            if call.args and call.args[0].startswith("Discord roles:")
+        )
+        assert "<@&111>" in role_call.args[0]
+        role_allowed = role_call.kwargs["allowed_mentions"]
+        assert [r.id for r in role_allowed.roles] == [111]
+        assert role_call.kwargs["allowed_mentions"].users is False
+        assert role_call.kwargs["allowed_mentions"].everyone is False
+
+        locality_call = next(
+            call
+            for call in calls
+            if call.args and call.args[0].startswith("Locality roles:")
+        )
+        assert "<@&222>" in locality_call.args[0]
+        locality_allowed = locality_call.kwargs["allowed_mentions"]
+        assert [r.id for r in locality_allowed.roles] == [222]
+        assert locality_call.kwargs["allowed_mentions"].users is False
+        assert locality_call.kwargs["allowed_mentions"].everyone is False
+
+        candidate_call = next(
+            call for call in calls if call.args and call.args[0].startswith("1. ")
+        )
+        assert_mentions_disabled(candidate_call)
+
     @pytest.mark.asyncio
     async def test_search_contacts_success(
         self, crm_cog, mock_interaction, mock_member_role

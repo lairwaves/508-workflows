@@ -2169,8 +2169,10 @@ class CRMCog(commands.Cog):
 
         for i, candidate in enumerate(candidates, start=1):
             label = "**[Member]**" if candidate.is_member else "[Prospect]"
-            name = candidate.name or "Unknown"
-            email = candidate.email_508 or candidate.email or "—"
+            name = discord.utils.escape_mentions(candidate.name or "Unknown")
+            email = discord.utils.escape_mentions(
+                candidate.email_508 or candidate.email or "—"
+            )
             crm_link = (
                 f"{crm_base}/#Contact/view/{candidate.crm_contact_id}"
                 if candidate.has_crm_link and candidate.crm_contact_id
@@ -2181,7 +2183,7 @@ class CRMCog(commands.Cog):
             else:
                 parts = [f"{i}. {label} {name} · {email}"]
                 if candidate.discord_user_id:
-                    parts.append(f"Discord: <@{candidate.discord_user_id}>")
+                    parts.append(f"Discord ID: {candidate.discord_user_id}")
 
             if candidate.linkedin:
                 parts.append(f"[LinkedIn](<{candidate.linkedin}>)")
@@ -2221,8 +2223,15 @@ class CRMCog(commands.Cog):
         current = ""
         for line in lines:
             candidate_block = line + "\n"
+            while len(candidate_block) > 1900:
+                if current:
+                    messages.append(current.rstrip())
+                    current = ""
+                messages.append(candidate_block[:1900].rstrip())
+                candidate_block = candidate_block[1900:]
             if len(current) + len(candidate_block) > 1900:
-                messages.append(current.rstrip())
+                if current:
+                    messages.append(current.rstrip())
                 current = candidate_block
             else:
                 current += candidate_block
@@ -2320,8 +2329,11 @@ class CRMCog(commands.Cog):
             requirements=requirements,
             candidates=candidates,
         )
+        safe_mentions = discord.AllowedMentions(
+            roles=False, users=False, everyone=False
+        )
         for msg in messages:
-            await thread.send(msg)
+            await thread.send(msg, allowed_mentions=safe_mentions)
 
     def _backend_headers(self) -> dict[str, str]:
         """Build auth headers for internal backend API calls."""
@@ -7602,13 +7614,306 @@ class CRMCog(commands.Cog):
             )
             return
 
-        messages, resume_options = self._render_match_candidates_messages(
-            requirements=requirements,
-            candidates=candidates,
+        lines: list[str] = []
+
+        header_parts: list[str] = []
+        role_mentions_line: str | None = None
+        locality_mentions_line: str | None = None
+        role_mentions_role_ids: list[int] = []
+        locality_mentions_role_ids: list[int] = []
+        excluded_role_names = {
+            name.casefold() for name in DISCORD_ROLES_EXCLUDE_FROM_SYNC
+        }
+
+        def dedupe_role_names(role_names: list[str]) -> list[str]:
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for role_name in role_names:
+                cleaned = role_name.strip()
+                if not cleaned:
+                    continue
+                key = cleaned.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(cleaned)
+            return deduped
+
+        def build_role_mentions(role_names: list[str]) -> tuple[list[str], list[int]]:
+            if not role_names:
+                return [], []
+            if interaction.guild is None:
+                return [f"`{r}`" for r in role_names], []
+
+            role_id_map = self._get_role_id_cache().get(interaction.guild.id)
+            if role_id_map is None:
+                self._refresh_role_id_cache(interaction.guild)
+                role_id_map = self._get_role_id_cache().get(interaction.guild.id, {})
+
+            mentions: list[str] = []
+            seen_mentions: set[str] = set()
+            allowed_role_ids: list[int] = []
+            seen_role_ids: set[int] = set()
+            for role_name in role_names:
+                normalized_role_name = role_name.casefold()
+                if normalized_role_name in excluded_role_names:
+                    continue
+                role_id = role_id_map.get(normalized_role_name)
+                if role_id is not None:
+                    mention = f"<@&{role_id}>"
+                    if mention not in seen_mentions:
+                        seen_mentions.add(mention)
+                        mentions.append(mention)
+                    if role_id not in seen_role_ids:
+                        seen_role_ids.add(role_id)
+                        allowed_role_ids.append(role_id)
+                    continue
+                role = None
+                for guild_role in interaction.guild.roles:
+                    guild_role_name = guild_role.name.casefold()
+                    if guild_role_name in excluded_role_names:
+                        continue
+                    if guild_role_name == normalized_role_name:
+                        role = guild_role
+                        break
+                if role is not None:
+                    if role.mention not in seen_mentions:
+                        seen_mentions.add(role.mention)
+                        mentions.append(role.mention)
+                    if role.id not in seen_role_ids:
+                        seen_role_ids.add(role.id)
+                        allowed_role_ids.append(role.id)
+                else:
+                    mention = f"`{role_name}`"
+                    if mention not in seen_mentions:
+                        seen_mentions.add(mention)
+                        mentions.append(mention)
+            return mentions, allowed_role_ids
+
+        if requirements.title:
+            header_parts.append(f"**{requirements.title}**")
+        if requirements.discord_role_types:
+            role_types = dedupe_role_names(requirements.discord_role_types)
+            if role_types:
+                role_mentions, role_ids = build_role_mentions(role_types)
+                if role_mentions:
+                    role_mentions_line = "Discord roles: " + ", ".join(role_mentions)
+                    role_mentions_role_ids = role_ids
+
+        locality_role_names: list[str] = []
+        location_text_parts: list[str] = []
+        if requirements.raw_location_text:
+            location_text_parts.append(requirements.raw_location_text)
+        if requirements.preferred_timezones:
+            location_text_parts.extend(requirements.preferred_timezones)
+        location_text = " ".join(location_text_parts).casefold()
+
+        if requirements.location_type == "us_only" or "united states" in location_text:
+            locality_role_names.append("USA")
+        if "usa" in location_text:
+            locality_role_names.append("USA")
+        if (
+            "europe" in location_text
+            or "emea" in location_text
+            or "e.u." in location_text
+        ):
+            locality_role_names.append("Europe")
+        if (
+            "americas" in location_text
+            or "latin america" in location_text
+            or "latam" in location_text
+        ):
+            locality_role_names.append("Americas")
+        if "north america" in location_text or "south america" in location_text:
+            locality_role_names.append("Americas")
+        if (
+            "asia" in location_text
+            or "apac" in location_text
+            or "asia pacific" in location_text
+        ):
+            locality_role_names.append("Asia")
+        if "japan" in location_text:
+            locality_role_names.append("Japan")
+        if "taiwan" in location_text:
+            locality_role_names.append("Taiwan")
+        if "africa" in location_text:
+            locality_role_names.append("Africa")
+
+        if requirements.preferred_timezones:
+            for tz in requirements.preferred_timezones:
+                tz_prefix = (
+                    tz.split("/", 1)[0].casefold() if "/" in tz else tz.casefold()
+                )
+                if tz_prefix == "europe":
+                    locality_role_names.append("Europe")
+                elif tz_prefix == "america":
+                    locality_role_names.append("Americas")
+                elif tz_prefix == "asia":
+                    locality_role_names.append("Asia")
+                elif tz_prefix == "africa":
+                    locality_role_names.append("Africa")
+                if tz.casefold() == "asia/tokyo":
+                    locality_role_names.append("Japan")
+                if tz.casefold() == "asia/taipei":
+                    locality_role_names.append("Taiwan")
+
+        locality_role_names = [
+            role_name
+            for role_name in dedupe_role_names(locality_role_names)
+            if role_name.casefold() not in excluded_role_names
+        ]
+        if locality_role_names:
+            locality_mentions, role_ids = build_role_mentions(locality_role_names)
+            if locality_mentions:
+                locality_mentions_line = "Locality roles: " + ", ".join(
+                    locality_mentions
+                )
+                locality_mentions_role_ids = role_ids
+        if requirements.required_skills:
+            header_parts.append(
+                "Skills: "
+                + ", ".join(f"`{s}`" for s in requirements.required_skills[:8])
+            )
+        if requirements.seniority:
+            header_parts.append(f"Seniority: `{requirements.seniority}`")
+        if requirements.location_type == "us_only":
+            header_parts.append("📍 US only")
+        elif requirements.raw_location_text:
+            header_parts.append(f"📍 {requirements.raw_location_text}")
+
+        header_lines: list[str] = ["## Job Match Results"]
+        if header_parts:
+            header_lines.append(" · ".join(header_parts))
+        header_lines.append(f"Found **{len(candidates)}** candidate(s).")
+
+        header_message = "\n".join(header_lines)
+        await interaction.followup.send(
+            header_message,
+            allowed_mentions=discord.AllowedMentions(
+                roles=False,
+                users=False,
+                everyone=False,
+            ),
         )
+        if role_mentions_line:
+            allowed_role_mentions = (
+                discord.AllowedMentions(
+                    roles=[discord.Object(id=rid) for rid in role_mentions_role_ids],
+                    users=False,
+                    everyone=False,
+                )
+                if role_mentions_role_ids
+                else discord.AllowedMentions(
+                    roles=False,
+                    users=False,
+                    everyone=False,
+                )
+            )
+            await interaction.followup.send(
+                role_mentions_line,
+                allowed_mentions=allowed_role_mentions,
+            )
+        if locality_mentions_line:
+            allowed_locality_mentions = (
+                discord.AllowedMentions(
+                    roles=[
+                        discord.Object(id=rid) for rid in locality_mentions_role_ids
+                    ],
+                    users=False,
+                    everyone=False,
+                )
+                if locality_mentions_role_ids
+                else discord.AllowedMentions(
+                    roles=False,
+                    users=False,
+                    everyone=False,
+                )
+            )
+            await interaction.followup.send(
+                locality_mentions_line,
+                allowed_mentions=allowed_locality_mentions,
+            )
+
+        crm_base = settings.espo_base_url.rstrip("/")
+        resume_options: list[tuple[str, str, str]] = []
+
+        for i, c in enumerate(candidates, start=1):
+            label = "**[Member]**" if c.is_member else "[Prospect]"
+            name = discord.utils.escape_mentions(c.name or "Unknown")
+            email = discord.utils.escape_mentions(c.email_508 or c.email or "—")
+            crm_link = (
+                f"{crm_base}/#Contact/view/{c.crm_contact_id}"
+                if c.has_crm_link and c.crm_contact_id
+                else None
+            )
+            if crm_link:
+                parts = [f"{i}. {label} [{name}](<{crm_link}>) · {email}"]
+            else:
+                parts = [f"{i}. {label} {name} · {email}"]
+                if c.discord_user_id:
+                    parts.append(f"Discord ID: {c.discord_user_id}")
+
+            if c.linkedin:
+                parts.append(f"[LinkedIn](<{c.linkedin}>)")
+            if (
+                c.latest_resume_id
+                and c.latest_resume_name
+                and c.latest_resume_name not in AUTO_MATCH_EXCLUDED_RESUME_NAMES
+            ):
+                safe_resume_name = discord.utils.escape_mentions(c.latest_resume_name)
+                parts.append(f"Resume: `{safe_resume_name}`")
+                resume_options.append((name, c.latest_resume_id, safe_resume_name))
+
+            skill_info: list[str] = []
+            match_score = getattr(c, "match_score", None)
+            if isinstance(match_score, (int, float)):
+                skill_info.append(f"score: {match_score:.1f}")
+            if c.matched_required_skills:
+                skill_info.append(
+                    "✅ " + ", ".join(f"`{s}`" for s in c.matched_required_skills[:5])
+                )
+            if c.matched_discord_roles:
+                skill_info.append(
+                    "🏷️ " + ", ".join(f"`{r}`" for r in c.matched_discord_roles)
+                )
+            if c.seniority:
+                skill_info.append(f"seniority: `{c.seniority}`")
+            if c.timezone:
+                skill_info.append(f"tz: `{c.timezone}`")
+            if skill_info:
+                parts.append("   " + " · ".join(skill_info))
+
+            lines.append("\n".join(parts))
+
+        # Paginate: Discord followup allows multiple sends; split on 1900-char chunks.
+        messages: list[str] = []
+        current = ""
+        for line in lines:
+            candidate_block = line + "\n"
+            while len(candidate_block) > 1900:
+                if current:
+                    messages.append(current.rstrip())
+                    current = ""
+                messages.append(candidate_block[:1900].rstrip())
+                candidate_block = candidate_block[1900:]
+            if len(current) + len(candidate_block) > 1900:
+                if current:
+                    messages.append(current.rstrip())
+                current = candidate_block
+            else:
+                current += candidate_block
+        if current.strip():
+            messages.append(current.rstrip())
 
         for msg in messages:
-            await interaction.followup.send(msg)
+            await interaction.followup.send(
+                msg,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=False,
+                    users=False,
+                    everyone=False,
+                ),
+            )
         if resume_options:
             await interaction.followup.send(
                 "Resume download:",
@@ -7678,10 +7983,50 @@ class CRMCog(commands.Cog):
                 skipped += 1
         return updated, skipped, failed
 
+    def _get_role_id_cache(self) -> dict[int, dict[str, int]]:
+        cache = getattr(self, "_role_id_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_role_id_cache", cache)
+        return cache
+
+    def _refresh_role_id_cache(self, guild: discord.Guild) -> None:
+        excluded_names = {name.casefold() for name in DISCORD_ROLES_EXCLUDE_FROM_SYNC}
+        role_id_map: dict[str, int] = {}
+        sorted_roles = sorted(
+            guild.roles,
+            key=lambda role: (-getattr(role, "position", 0), role.id),
+        )
+        for role in sorted_roles:
+            normalized_name = role.name.casefold()
+            if normalized_name in excluded_names or normalized_name in role_id_map:
+                continue
+            role_id_map[normalized_name] = role.id
+        self._get_role_id_cache()[guild.id] = role_id_map
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role: discord.Role) -> None:
+        self._refresh_role_id_cache(role.guild)
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role) -> None:
+        self._refresh_role_id_cache(role.guild)
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(
+        self, before: discord.Role, after: discord.Role
+    ) -> None:
+        self._refresh_role_id_cache(after.guild)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        self._get_role_id_cache().pop(guild.id, None)
+
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         """Bulk-sync all guild member roles on startup."""
         for guild in self.bot.guilds:
+            self._refresh_role_id_cache(guild)
             try:
                 channel_ids = await self._refresh_jobs_channel_cache(guild.id)
                 logger.info(
