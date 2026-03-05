@@ -2,9 +2,11 @@
 Unit tests for CRM cog functionality.
 """
 
-import pytest
-from unittest.mock import Mock, AsyncMock, patch
+import json
+from unittest.mock import AsyncMock, Mock, patch
+
 import discord
+import pytest
 
 from five08.discord_bot.cogs.crm import (
     CRMCog,
@@ -19,6 +21,8 @@ from five08.discord_bot.cogs.crm import (
     ResumeEditSocialLinksButton,
     ResumeEditWebsitesModal,
     ResumeEditSocialLinksModal,
+    ResumeEditSkillsButton,
+    ResumeEditSkillsModal,
     _extract_parsed_seniority,
     _format_seniority_label,
 )
@@ -322,6 +326,36 @@ class TestCRMCog:
         )
 
     @pytest.mark.asyncio
+    async def test_resume_update_view_adds_skills_button_when_skills_proposed(
+        self, crm_cog
+    ):
+        """Edit Skills button should appear when skills are in proposed updates."""
+        view = ResumeUpdateConfirmationView(
+            crm_cog=crm_cog,
+            requester_id=123,
+            contact_id="contact-1",
+            contact_name="Test User",
+            proposed_updates={"skills": ["python"]},
+        )
+
+        assert any(isinstance(child, ResumeEditSkillsButton) for child in view.children)
+
+    @pytest.mark.asyncio
+    async def test_resume_update_view_no_skills_button_without_skills(self, crm_cog):
+        """Edit Skills button should not appear when skills are absent."""
+        view = ResumeUpdateConfirmationView(
+            crm_cog=crm_cog,
+            requester_id=123,
+            contact_id="contact-1",
+            contact_name="Test User",
+            proposed_updates={},
+        )
+
+        assert not any(
+            isinstance(child, ResumeEditSkillsButton) for child in view.children
+        )
+
+    @pytest.mark.asyncio
     async def test_edit_websites_modal_prepopulates_list_values(self, crm_cog):
         """Edit Websites modal should pre-fill with proposed website list, one per line."""
         view = ResumeUpdateConfirmationView(
@@ -360,6 +394,24 @@ class TestCRMCog:
             modal.social_links_input.default
             == "https://linkedin.com/in/user\nhttps://x.com/user"
         )
+
+    @pytest.mark.asyncio
+    async def test_edit_skills_modal_prepopulates_list_values(self, crm_cog):
+        """Edit Skills modal should pre-fill with proposed skills + strengths."""
+        view = ResumeUpdateConfirmationView(
+            crm_cog=crm_cog,
+            requester_id=123,
+            contact_id="contact-1",
+            contact_name="Test User",
+            proposed_updates={
+                "skills": ["python", "go", "rust"],
+                "cSkillAttrs": {"python": {"strength": 5}, "rust": {"strength": 4}},
+            },
+        )
+
+        modal = ResumeEditSkillsModal(confirmation_view=view)
+
+        assert modal.skills_input.default == "python: 5\ngo\nrust: 4"
 
     @pytest.mark.asyncio
     async def test_edit_websites_modal_submit_updates_proposed(
@@ -410,6 +462,36 @@ class TestCRMCog:
         mock_interaction.response.send_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_edit_skills_modal_submit_updates_proposed(
+        self, crm_cog, mock_interaction
+    ):
+        """Submitting the Edit Skills modal should update skills and strengths."""
+        view = ResumeUpdateConfirmationView(
+            crm_cog=crm_cog,
+            requester_id=123,
+            contact_id="contact-1",
+            contact_name="Test User",
+            proposed_updates={
+                "skills": ["python", "go", "rust"],
+                "cSkillAttrs": json.dumps(
+                    {"python": {"strength": 2}, "rust": {"strength": 4}}
+                ),
+            },
+        )
+        modal = ResumeEditSkillsModal(confirmation_view=view)
+        modal.skills_input._value = "python: 5\nrust"
+
+        await modal.on_submit(mock_interaction)
+
+        assert view.proposed_updates["skills"] == ["python", "rust"]
+        parsed_attrs = json.loads(view.proposed_updates["cSkillAttrs"])
+        assert parsed_attrs == {
+            "python": {"strength": 5},
+            "rust": {"strength": 4},
+        }
+        mock_interaction.response.send_message.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_edit_websites_modal_submit_removes_field_when_blank(
         self, crm_cog, mock_interaction
     ):
@@ -446,6 +528,78 @@ class TestCRMCog:
         await modal.on_submit(mock_interaction)
 
         assert "cSocialLinks" not in view.proposed_updates
+
+    @pytest.mark.asyncio
+    async def test_edit_skills_modal_submit_removes_fields_when_blank(
+        self, crm_cog, mock_interaction
+    ):
+        """Clearing skills in the modal should remove skill updates."""
+        view = ResumeUpdateConfirmationView(
+            crm_cog=crm_cog,
+            requester_id=123,
+            contact_id="contact-1",
+            contact_name="Test User",
+            proposed_updates={
+                "skills": ["python", "go"],
+                "cSkillAttrs": {"python": {"strength": 5}},
+            },
+        )
+        modal = ResumeEditSkillsModal(confirmation_view=view)
+        modal.skills_input._value = "   \n  \n  "
+
+        await modal.on_submit(mock_interaction)
+
+        assert "skills" not in view.proposed_updates
+        assert "cSkillAttrs" not in view.proposed_updates
+
+    def test_resume_preview_skills_delta_added_removed_and_strengths(self, crm_cog):
+        """Skills preview should summarize added/removed/strength changes."""
+        embed, _ = crm_cog._build_resume_preview_embed(
+            contact_id="contact-1",
+            contact_name="Test User",
+            result={
+                "proposed_changes": [
+                    {
+                        "field": "skills",
+                        "label": "Skills",
+                        "current": "python (3), go (2)",
+                        "proposed": "python (4), rust (5)",
+                    }
+                ]
+            },
+            link_member=None,
+        )
+
+        proposed_field = next(
+            field for field in embed.fields if field.name == "Proposed Changes"
+        )
+        assert "Added: rust (5)" in proposed_field.value
+        assert "Strengths: python (3->4)" in proposed_field.value
+        assert "Removed: go (2)" in proposed_field.value
+
+    def test_resume_preview_skills_delta_noop_falls_back_to_full_line(self, crm_cog):
+        """Skills preview should fall back to current → proposed when no delta."""
+        embed, _ = crm_cog._build_resume_preview_embed(
+            contact_id="contact-1",
+            contact_name="Test User",
+            result={
+                "proposed_changes": [
+                    {
+                        "field": "skills",
+                        "label": "Skills",
+                        "current": "python (3), go (2)",
+                        "proposed": "python (3), go (2)",
+                    }
+                ]
+            },
+            link_member=None,
+        )
+
+        proposed_field = next(
+            field for field in embed.fields if field.name == "Proposed Changes"
+        )
+        assert "python (3), go (2)" in proposed_field.value
+        assert "→" in proposed_field.value
 
     @pytest.mark.asyncio
     async def test_edit_websites_button_callback_opens_modal(
