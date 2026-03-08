@@ -511,18 +511,43 @@ class JobsCog(DiscordAuditCogMixin, commands.Cog):
 
         for i, candidate in enumerate(candidates, start=1):
             label = "**[Member]**" if candidate.is_member else "[Prospect]"
-            name = discord.utils.escape_mentions(candidate.name or "Unknown")
+            raw_crm_name = (
+                candidate.crm_name.strip()
+                if isinstance(candidate.crm_name, str) and candidate.crm_name.strip()
+                else None
+            )
+            raw_display_name = (
+                candidate.name.strip()
+                if isinstance(candidate.name, str) and candidate.name.strip()
+                else None
+            )
+            resolved_name = discord.utils.escape_mentions(
+                raw_crm_name or raw_display_name or "Unknown"
+            )
+            normalized_discord_username = (
+                candidate.discord_username.strip()
+                if isinstance(candidate.discord_username, str)
+                else None
+            )
+            discord_username = (
+                discord.utils.escape_mentions(normalized_discord_username.lstrip("@"))
+                if normalized_discord_username
+                and normalized_discord_username.lstrip("@")
+                else None
+            )
             crm_link = (
                 f"{crm_base}/#Contact/view/{candidate.crm_contact_id}"
                 if candidate.has_crm_link and candidate.crm_contact_id
                 else None
             )
             if crm_link:
-                parts = [f"{i}. {label} [{name}](<{crm_link}>)"]
+                display_name = f"[{resolved_name}](<{crm_link}>)"
             else:
-                parts = [f"{i}. {label} {name}"]
-                if candidate.discord_user_id:
-                    parts.append(f"Discord ID: {candidate.discord_user_id}")
+                display_name = resolved_name
+
+            parts = [f"{i}. {label} {display_name}"]
+            if discord_username:
+                parts.append(f"`@{discord_username}`")
 
             if candidate.linkedin:
                 parts.append(f"[LinkedIn](<{candidate.linkedin}>)")
@@ -535,7 +560,7 @@ class JobsCog(DiscordAuditCogMixin, commands.Cog):
                     candidate.latest_resume_name
                 )
                 resume_options.append(
-                    (name, candidate.latest_resume_id, safe_resume_name)
+                    (resolved_name, candidate.latest_resume_id, safe_resume_name)
                 )
 
             skill_info: list[str] = []
