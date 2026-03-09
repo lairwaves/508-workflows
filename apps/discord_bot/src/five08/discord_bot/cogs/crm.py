@@ -1023,7 +1023,9 @@ class ResumeEditDiscordRolesModal(discord.ui.Modal, title="Edit Discord Roles"):
         self.confirmation_view.discord_role_suggestions = normalized
         for item in self.confirmation_view.children:
             if isinstance(item, ResumeApplyDiscordRolesButton):
-                item.disabled = not bool(normalized)
+                item.disabled = not (
+                    self.confirmation_view.can_apply_discord_roles and bool(normalized)
+                )
 
         if normalized:
             count = len(normalized)
@@ -1269,11 +1271,12 @@ class ResumeEditDiscordRolesButton(discord.ui.Button["ResumeUpdateConfirmationVi
 class ResumeApplyDiscordRolesButton(discord.ui.Button["ResumeUpdateConfirmationView"]):
     """Button that applies suggested Discord roles to the linked member."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, disabled: bool = False) -> None:
         super().__init__(
             label="Apply Discord Roles",
             style=discord.ButtonStyle.success,
             custom_id="resume_apply_discord_roles",
+            disabled=disabled,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1305,6 +1308,18 @@ class ResumeApplyDiscordRolesButton(discord.ui.Button["ResumeUpdateConfirmationV
                 resource_type="crm_contact",
                 resource_id=view.contact_id,
             )
+
+        if not view.can_apply_discord_roles:
+            _audit_apply_roles_event(
+                "denied",
+                "missing_linked_user",
+                {"reason": "button_disabled_for_role_application"},
+            )
+            await interaction.response.send_message(
+                "❌ Discord roles can only be applied after linking this contact to a Discord user.",
+                ephemeral=True,
+            )
+            return
 
         if not interaction.guild:
             await interaction.response.send_message(
@@ -1605,6 +1620,7 @@ class ResumeUpdateConfirmationView(discord.ui.View):
         parsed_seniority: str | None = None,
         discord_role_suggestions: list[str] | None = None,
         discord_role_target_user_id: str | None = None,
+        can_apply_discord_roles: bool = False,
     ) -> None:
         super().__init__(timeout=300)
         self.crm_cog = crm_cog
@@ -1615,6 +1631,11 @@ class ResumeUpdateConfirmationView(discord.ui.View):
         self.link_discord = link_discord
         self.parsed_seniority = parsed_seniority
         self.discord_role_target_user_id = discord_role_target_user_id
+        self.can_apply_discord_roles = bool(
+            can_apply_discord_roles
+            or discord_role_target_user_id
+            or (isinstance(link_discord, dict) and bool(link_discord.get("user_id")))
+        )
         self.discord_role_suggestions = list(
             dict.fromkeys(discord_role_suggestions or [])
         )
@@ -1630,7 +1651,9 @@ class ResumeUpdateConfirmationView(discord.ui.View):
             self.add_item(ResumeEditRolesButton())
         if self.discord_role_suggestions:
             self.add_item(ResumeEditDiscordRolesButton())
-            self.add_item(ResumeApplyDiscordRolesButton())
+            self.add_item(
+                ResumeApplyDiscordRolesButton(disabled=not self.can_apply_discord_roles)
+            )
         self.add_item(ResumeEditLocationButton())
 
         if parsed_seniority:
@@ -3667,6 +3690,7 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
         locality_roles: list[str] | None = None,
         extracted_profile: dict[str, Any] | None = None,
         current_discord_roles: list[str] | None = None,
+        can_apply_discord_roles: bool = False,
     ) -> discord.Embed | None:
         """Build a separate embed suggesting Discord roles to add based on resume data.
 
@@ -3689,6 +3713,16 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
             description=f"Roles to **add** for **{contact_name}** based on resume — never remove existing roles.",
             color=0x57F287,
         )
+        if not can_apply_discord_roles:
+            embed.add_field(
+                name="🔒 Link required",
+                value=(
+                    "This contact is not currently linked to a Discord user, so suggested roles "
+                    "cannot be applied automatically. Link them first in CRM or use "
+                    "`/link-discord-user`."
+                ),
+                inline=False,
+            )
 
         if technical:
             embed.add_field(
@@ -3890,6 +3924,7 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
         role_suggestions_embed: discord.Embed | None = None
         suggested_discord_roles: list[str] = []
         discord_role_target_user_id: str | None = None
+        can_apply_discord_roles = False
         if action_name == "crm.reprocess_resume" or (
             action_name == "crm.upload_resume" and link_member
         ):
@@ -3932,10 +3967,12 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
             suggested_discord_roles = list(
                 dict.fromkeys(technical_suggestions + locality_suggestions)
             )
+            can_apply_discord_roles = bool(discord_role_target_user_id or link_member)
             role_suggestions_embed = self._build_role_suggestions_embed(
                 contact_name=contact_name,
                 technical_roles=technical_suggestions,
                 locality_roles=locality_suggestions,
+                can_apply_discord_roles=can_apply_discord_roles,
             )
 
         if not proposed_updates and not link_member and not parsed_seniority:
@@ -3970,6 +4007,7 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
                 parsed_seniority=parsed_seniority,
                 discord_role_suggestions=suggested_discord_roles,
                 discord_role_target_user_id=discord_role_target_user_id,
+                can_apply_discord_roles=can_apply_discord_roles,
             )
             if action_name != "crm.reprocess_resume":
                 self._audit_command(
@@ -4015,6 +4053,7 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
             parsed_seniority=parsed_seniority,
             discord_role_suggestions=suggested_discord_roles,
             discord_role_target_user_id=discord_role_target_user_id,
+            can_apply_discord_roles=can_apply_discord_roles,
         )
         if action_name != "crm.reprocess_resume":
             self._audit_command(
