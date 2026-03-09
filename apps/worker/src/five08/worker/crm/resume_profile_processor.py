@@ -12,6 +12,7 @@ from typing import Any
 from five08.clients.espo import EspoAPIError, EspoClient
 from five08.crm_normalization import (
     ROLE_NORMALIZATION_MAP,
+    normalized_website_identity_key,
     normalize_city,
     normalize_country,
     normalize_role,
@@ -1046,8 +1047,8 @@ class ResumeProfileProcessor:
             normalized_link = self._normalize_website_url(raw_value.strip())
             if normalized_link is None:
                 continue
-            dedupe_key = normalized_link.casefold()
-            if dedupe_key in seen:
+            dedupe_key = normalized_website_identity_key(normalized_link)
+            if dedupe_key is None or dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
             normalized.append(normalized_link)
@@ -1066,8 +1067,8 @@ class ResumeProfileProcessor:
             normalized = self._normalize_website_url(value)
             if not normalized:
                 continue
-            dedupe_key = normalized.casefold()
-            if dedupe_key in seen:
+            dedupe_key = normalized_website_identity_key(normalized)
+            if dedupe_key is None or dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
             merged.append(normalized)
@@ -1078,8 +1079,8 @@ class ResumeProfileProcessor:
             normalized = self._normalize_website_url(value)
             if not normalized:
                 continue
-            dedupe_key = normalized.casefold()
-            if dedupe_key in seen:
+            dedupe_key = normalized_website_identity_key(normalized)
+            if dedupe_key is None or dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
             merged.append(normalized)
