@@ -1851,13 +1851,13 @@ class ResumeProfileExtractor:
         api_key: str | None,
         base_url: str | None = None,
         model: str = "gpt-5-mini",
-        max_tokens: int = 800,
+        max_tokens: int = 2000,
         snippet_chars: int = 12000,
     ) -> None:
         self.model = model.strip() if model else "gpt-5-mini"
         if not self.model:
             self.model = "gpt-5-mini"
-        self.max_tokens = max_tokens
+        self.max_tokens = max(1, max_tokens)
         self.snippet_chars = max(1000, snippet_chars)
         self.client: Any = None
 
@@ -1893,41 +1893,53 @@ class ResumeProfileExtractor:
 
         raw_content: str | None = None
         parsed: dict[str, Any] | None = None
+        attempt_max_tokens = self.max_tokens
+        got_successful_response = False
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You extract structured candidate profile fields for a CRM. "
-                            "Return JSON only with no commentary. "
-                            "Prefer explicit evidence from the provided text. "
-                            "Be conservative for contact/location/website fields, but proactive for role and seniority inference. "
-                            "For primary_roles and seniority_level, infer the best fit from titles, summary, and work history even when labels are not explicit. "
-                            "Never fabricate details or use outside knowledge. "
-                            "Assume candidates are typically technical professionals unless the resume clearly indicates otherwise."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": self._build_prompt(
-                            source_texts=source_texts,
-                            primary_text=text,
-                        ),
-                    },
-                ],
-                temperature=0.1,
-                max_tokens=self.max_tokens,
-            )
-            choices = getattr(response, "choices", None)
-            first_choice = choices[0] if choices else None
-            message = getattr(first_choice, "message", None)
-            raw_content = getattr(message, "content", None) if message else None
-            if not raw_content:
+            for attempt_index in range(2):
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You extract structured candidate profile fields for a CRM. "
+                                "Return JSON only with no commentary. "
+                                "Prefer explicit evidence from the provided text. "
+                                "Be conservative for contact/location/website fields, but proactive for role and seniority inference. "
+                                "For primary_roles and seniority_level, infer the best fit from titles, summary, and work history even when labels are not explicit. "
+                                "Never fabricate details or use outside knowledge. "
+                                "Assume candidates are typically technical professionals unless the resume clearly indicates otherwise."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": self._build_prompt(
+                                source_texts=source_texts,
+                                primary_text=text,
+                            ),
+                        },
+                    ],
+                    temperature=0.1,
+                    max_tokens=attempt_max_tokens,
+                )
+                choices = getattr(response, "choices", None)
+                first_choice = choices[0] if choices else None
+                message = getattr(first_choice, "message", None)
+                raw_content = getattr(message, "content", None) if message else None
+                if not raw_content:
+                    finish_reason = getattr(first_choice, "finish_reason", None)
+                    if attempt_index == 0 and finish_reason == "length":
+                        attempt_max_tokens = self.max_tokens * 2
+                        continue
+                    raise _empty_llm_content_error(response)
+
+                parsed = _parse_json_object(raw_content)
+                got_successful_response = True
+                break
+            if not got_successful_response or parsed is None:
                 raise _empty_llm_content_error(response)
 
-            parsed = _parse_json_object(raw_content)
             raw_first_name = parsed.get("firstName")
             if raw_first_name is None:
                 raw_first_name = parsed.get("first_name")
