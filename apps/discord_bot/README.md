@@ -53,6 +53,20 @@ This document captures Discord bot behavior, permissions, and slash command usag
     - `cIdVerifiedBy` ← `verified_by`
     - `cVerifiedIdType` ← `id_type`
 
+- `/create-sso-user`
+  - Description: Create or link an Authentik SSO user for a CRM contact.
+  - Required role: Admin
+  - Prerequisites: `AUTHENTIK_API_BASE_URL` and `AUTHENTIK_API_TOKEN` must be configured. Recovery emails resolve the Authentik Email Stage by `AUTHENTIK_RECOVERY_EMAIL_STAGE_NAME` (defaults to `default-recovery-email`), with `AUTHENTIK_RECOVERY_EMAIL_STAGE_ID` available as an override.
+  - Args:
+    - `search_term` (required): Discord mention, email, 508 username, or contact ID.
+  - Behavior:
+    - Derives `username` from the contact's `@508.dev` email.
+    - Supports Discord mentions by resolving the contact from `cDiscordUserID`.
+    - If `cSsoID` is already populated, retrieves that Authentik user and validates it still matches the CRM-derived username/email.
+    - If `cSsoID` is blank, searches Authentik by exact username and exact `@508.dev` email before creating anything.
+    - Updates CRM `cSsoID` with the Authentik numeric user id (`pk`).
+    - Sends the Authentik recovery email only when the user was newly created, auto-resolving the Email Stage by name unless a UUID override is configured.
+
 - `/send-member-agreement`
   - Description: Send the member agreement for signature through DocuSeal.
   - Required role: Steering Committee
