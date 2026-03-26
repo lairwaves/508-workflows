@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import unescape
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urljoin, urlsplit
 
 from curl_cffi import CurlOpt, requests as curl_requests
@@ -57,8 +57,11 @@ SUPPORTED_RESUME_FILE_EXTENSIONS = ("pdf", "docx")
 DEFAULT_RESUME_MAX_FILE_SIZE_MB = 10
 LINKEDIN_FIELD = "cLinkedIn"
 PROFILE_SOURCE_FETCH_TIMEOUT_SECONDS = 10.0
+PROFILE_SOURCE_BROWSER_TIMEOUT_SECONDS = 20.0
+PROFILE_SOURCE_BROWSER_TIMEOUT_MS = int(PROFILE_SOURCE_BROWSER_TIMEOUT_SECONDS * 1000)
 PROFILE_SOURCE_MAX_REDIRECTS = 3
 PROFILE_SOURCE_MAX_BYTES = 512 * 1024
+PROFILE_SOURCE_BROWSER_RESOURCE_MAX_BYTES = 10 * 1024 * 1024
 PROFILE_SOURCE_MAX_TEXT_CHARS = 12000
 PROFILE_SOURCE_MAX_WEBSITES = 2
 PROFILE_SOURCE_ALLOWED_PORTS = frozenset({80, 443})
@@ -69,6 +72,29 @@ PROFILE_SOURCE_ALLOWED_CONTENT_TYPES = (
     "text/plain",
     "application/xhtml+xml",
     "text/markdown",
+)
+PROFILE_SOURCE_JS_SPARSE_TEXT_MAX_CHARS = 250
+PROFILE_SOURCE_JS_SPARSE_TEXT_MAX_WORDS = 40
+PROFILE_SOURCE_JS_HTML_MIN_CHARS = 2000
+PROFILE_SOURCE_JS_RENDER_MARKERS = (
+    'id="__next"',
+    "id='__next'",
+    'id="__nuxt"',
+    "id='__nuxt'",
+    'id="root"',
+    "id='root'",
+    'id="app"',
+    "id='app'",
+    "data-reactroot",
+    "__next_data__",
+    "__next_f",
+    "__nuxt__",
+    "window.__next_data__",
+    "window.__nuxt__",
+    "enable javascript",
+    "requires javascript",
+    "javascript to run this app",
+    "please turn on javascript",
 )
 _HTML_BLOCK_RE = re.compile(
     r"(?is)<(script|style|noscript|svg|nav|header|footer)[^>]*>.*?</\1>"
@@ -220,6 +246,31 @@ class _ExternalProfileSourceCandidate:
     url: str
     origin: str
     source_key: str
+
+
+@dataclass(frozen=True)
+class ProfileSourceHttpResponse:
+    final_url: str
+    status_code: int
+    headers: dict[str, str]
+    body: bytes
+
+    @property
+    def content_type(self) -> str:
+        return str(self.headers.get("content-type", ""))
+
+
+@dataclass(frozen=True)
+class ProfileSourceFetchDiagnostics:
+    url: str
+    final_url: str | None
+    content_type: str | None
+    selected_text: str | None
+    curl_text: str | None
+    browser_attempted: bool
+    browser_used: bool
+    browser_text: str | None
+    error: str | None
 
 
 class ResumeProfileProcessor:
@@ -1338,7 +1389,10 @@ class ResumeProfileProcessor:
                 continue
 
             try:
-                fetched = self._fetch_external_profile_source_text(candidate.url)
+                fetched = self._fetch_external_profile_source_text(
+                    candidate.url,
+                    allow_javascript_fallback=candidate.label == "Personal Website",
+                )
             except Exception as exc:
                 enrichments.append(
                     ResumeSourceEnrichment(
@@ -1378,12 +1432,133 @@ class ResumeProfileProcessor:
 
         return extra_sources, enrichments
 
-    def _fetch_external_profile_source_text(self, url: str) -> str:
-        current_url = url
-        headers = {
-            "User-Agent": PROFILE_SOURCE_USER_AGENT,
-            "Accept": ", ".join(PROFILE_SOURCE_ALLOWED_CONTENT_TYPES),
+    def _fetch_external_profile_source_text(
+        self,
+        url: str,
+        *,
+        allow_javascript_fallback: bool = False,
+    ) -> str:
+        diagnostics = self.inspect_profile_source_fetch(
+            url,
+            allow_javascript_fallback=allow_javascript_fallback,
+        )
+        if diagnostics.selected_text:
+            return diagnostics.selected_text
+        raise ValueError(
+            diagnostics.error or "Profile page did not contain usable text"
+        )
+
+    def inspect_profile_source_fetch(
+        self,
+        url: str,
+        *,
+        allow_javascript_fallback: bool = False,
+    ) -> ProfileSourceFetchDiagnostics:
+        response = self._fetch_external_profile_source_response(url)
+        extracted = ""
+        extraction_error: ValueError | None = None
+        try:
+            extracted = self._extract_profile_source_text(
+                body=response.body,
+                content_type=response.content_type,
+            )
+        except ValueError as exc:
+            extraction_error = exc
+
+        browser_attempted = False
+        browser_used = False
+        browser_text: str | None = None
+        if allow_javascript_fallback and self._should_retry_profile_source_with_browser(
+            body=response.body,
+            content_type=response.content_type,
+            extracted_text=extracted,
+        ):
+            browser_attempted = True
+            try:
+                browser_text = self._fetch_external_profile_source_text_with_browser(
+                    response
+                )
+            except ValueError as exc:
+                logger.info(
+                    "Profile JS fallback failed url=%s error=%s",
+                    response.final_url,
+                    exc,
+                )
+            else:
+                browser_used = self._rendered_profile_source_text_is_better(
+                    rendered_text=browser_text,
+                    extracted_text=extracted,
+                )
+
+        selected_text: str | None = None
+        error: str | None = None
+        if browser_used and browser_text:
+            selected_text = browser_text
+        elif extracted:
+            selected_text = extracted
+        elif extraction_error is not None:
+            error = str(extraction_error)
+        else:
+            error = "Profile page did not contain usable text"
+
+        return ProfileSourceFetchDiagnostics(
+            url=url,
+            final_url=response.final_url,
+            content_type=response.content_type,
+            selected_text=selected_text,
+            curl_text=extracted or None,
+            browser_attempted=browser_attempted,
+            browser_used=browser_used,
+            browser_text=browser_text,
+            error=error,
+        )
+
+    def _fetch_external_profile_source_response(
+        self, url: str
+    ) -> ProfileSourceHttpResponse:
+        return self._request_profile_http_response(
+            url,
+            method="GET",
+            headers={
+                "User-Agent": PROFILE_SOURCE_USER_AGENT,
+                "Accept": ", ".join(PROFILE_SOURCE_ALLOWED_CONTENT_TYPES),
+            },
+            body=None,
+            max_bytes=PROFILE_SOURCE_MAX_BYTES,
+            require_success=True,
+            size_limit_error="Profile page exceeds size limit",
+        )
+
+    def _fetch_browser_profile_request_response(
+        self, request: Any
+    ) -> ProfileSourceHttpResponse:
+        request_headers = {
+            str(key): str(value)
+            for key, value in getattr(request, "headers", {}).items()
+            if str(key).strip().lower() not in {"host", "content-length"}
         }
+        return self._request_profile_http_response(
+            str(getattr(request, "url", "")).strip(),
+            method=str(getattr(request, "method", "GET")).upper(),
+            headers=request_headers,
+            body=getattr(request, "post_data_buffer", None),
+            max_bytes=PROFILE_SOURCE_BROWSER_RESOURCE_MAX_BYTES,
+            require_success=False,
+            size_limit_error="Browser profile resource exceeds size limit",
+        )
+
+    def _request_profile_http_response(
+        self,
+        url: str,
+        *,
+        method: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        max_bytes: int,
+        require_success: bool,
+        size_limit_error: str,
+    ) -> ProfileSourceHttpResponse:
+        current_url = url
 
         for _ in range(PROFILE_SOURCE_MAX_REDIRECTS + 1):
             resolution = self._resolve_public_profile_request_target(current_url)
@@ -1393,9 +1568,11 @@ class ResumeProfileProcessor:
 
             try:
                 if host_is_ip_literal:
-                    response = curl_requests.get(
+                    response = curl_requests.request(
+                        cast(Any, method),
                         current_url,
                         headers=headers,
+                        data=body,
                         timeout=PROFILE_SOURCE_FETCH_TIMEOUT_SECONDS,
                         allow_redirects=False,
                         stream=True,
@@ -1411,33 +1588,21 @@ class ResumeProfileProcessor:
                             current_url = urljoin(current_url, redirect_to)
                             continue
 
-                        response.raise_for_status()
-                        content_type = str(
-                            response.headers.get("Content-Type", "")
-                        ).lower()
-                        content_length = response.headers.get("Content-Length")
-                        if content_length:
-                            try:
-                                content_length_value = int(content_length)
-                            except (TypeError, ValueError):
-                                content_length_value = None
-                            if (
-                                content_length_value is not None
-                                and content_length_value > PROFILE_SOURCE_MAX_BYTES
-                            ):
-                                raise ValueError("Profile page exceeds size limit")
-
-                        payload = bytearray()
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if not chunk:
-                                continue
-                            payload.extend(chunk)
-                            if len(payload) > PROFILE_SOURCE_MAX_BYTES:
-                                raise ValueError("Profile page exceeds size limit")
-
-                        return self._extract_profile_source_text(
-                            body=bytes(payload),
-                            content_type=content_type,
+                        if require_success:
+                            response.raise_for_status()
+                        payload = self._read_profile_http_response_body(
+                            response,
+                            max_bytes=max_bytes,
+                            size_limit_error=size_limit_error,
+                        )
+                        return ProfileSourceHttpResponse(
+                            final_url=current_url,
+                            status_code=int(response.status_code),
+                            headers={
+                                str(key).lower(): str(value)
+                                for key, value in response.headers.items()
+                            },
+                            body=payload,
                         )
                     finally:
                         response.close()
@@ -1450,9 +1615,11 @@ class ResumeProfileProcessor:
                         curl_options={CurlOpt.RESOLVE: resolve_entries}
                     )
                     with session:
-                        response = session.get(
+                        response = session.request(
+                            cast(Any, method),
                             current_url,
                             headers=headers,
+                            data=body,
                             timeout=PROFILE_SOURCE_FETCH_TIMEOUT_SECONDS,
                             allow_redirects=False,
                             stream=True,
@@ -1468,33 +1635,21 @@ class ResumeProfileProcessor:
                                 current_url = urljoin(current_url, redirect_to)
                                 continue
 
-                            response.raise_for_status()
-                            content_type = str(
-                                response.headers.get("Content-Type", "")
-                            ).lower()
-                            content_length = response.headers.get("Content-Length")
-                            if content_length:
-                                try:
-                                    content_length_value = int(content_length)
-                                except (TypeError, ValueError):
-                                    content_length_value = None
-                                if (
-                                    content_length_value is not None
-                                    and content_length_value > PROFILE_SOURCE_MAX_BYTES
-                                ):
-                                    raise ValueError("Profile page exceeds size limit")
-
-                            payload = bytearray()
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if not chunk:
-                                    continue
-                                payload.extend(chunk)
-                                if len(payload) > PROFILE_SOURCE_MAX_BYTES:
-                                    raise ValueError("Profile page exceeds size limit")
-
-                            return self._extract_profile_source_text(
-                                body=bytes(payload),
-                                content_type=content_type,
+                            if require_success:
+                                response.raise_for_status()
+                            payload = self._read_profile_http_response_body(
+                                response,
+                                max_bytes=max_bytes,
+                                size_limit_error=size_limit_error,
+                            )
+                            return ProfileSourceHttpResponse(
+                                final_url=current_url,
+                                status_code=int(response.status_code),
+                                headers={
+                                    str(key).lower(): str(value)
+                                    for key, value in response.headers.items()
+                                },
+                                body=payload,
                             )
                         finally:
                             response.close()
@@ -1502,6 +1657,81 @@ class ResumeProfileProcessor:
                 raise ValueError(f"Profile fetch failed: {exc}") from exc
 
         raise ValueError("Profile URL exceeded redirect limit")
+
+    def _read_profile_http_response_body(
+        self,
+        response: Any,
+        *,
+        max_bytes: int,
+        size_limit_error: str,
+    ) -> bytes:
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                content_length_value = int(content_length)
+            except (TypeError, ValueError):
+                content_length_value = None
+            if content_length_value is not None and content_length_value > max_bytes:
+                raise ValueError(size_limit_error)
+
+        payload = bytearray()
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ValueError(size_limit_error)
+        return bytes(payload)
+
+    def _fetch_external_profile_source_text_with_browser(
+        self,
+        initial_response: ProfileSourceHttpResponse,
+    ) -> str:
+        try:
+            from cloakbrowser import launch  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ValueError("JavaScript browser fallback is unavailable") from exc
+
+        navigation_url = initial_response.final_url
+        validation_error = self._validate_browser_profile_navigation_url(navigation_url)
+        if validation_error:
+            raise ValueError(validation_error)
+
+        response_cache: dict[str, ProfileSourceHttpResponse] = {
+            initial_response.final_url: initial_response
+        }
+        browser = None
+        try:
+            browser = launch()
+            page = browser.new_page()
+            page.route(
+                "**/*",
+                lambda route: self._handle_browser_profile_request_route(
+                    route, response_cache
+                ),
+            )
+            page.goto(
+                navigation_url,
+                wait_until="networkidle",
+                timeout=PROFILE_SOURCE_BROWSER_TIMEOUT_MS,
+            )
+            final_page_url = str(getattr(page, "url", "")).strip()
+            validation_error = self._validate_browser_profile_navigation_url(
+                final_page_url
+            )
+            if validation_error:
+                raise ValueError(validation_error)
+            rendered_html = page.content()
+        except Exception as exc:
+            raise ValueError(f"JavaScript profile fetch failed: {exc}") from exc
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    logger.debug("Failed to close CloakBrowser for %s", navigation_url)
+
+        return self._extract_rendered_profile_source_text(rendered_html)
 
     def _extract_profile_source_text(self, *, body: bytes, content_type: str) -> str:
         normalized_type = content_type.split(";", 1)[0].strip().lower()
@@ -1523,6 +1753,132 @@ class ResumeProfileProcessor:
         if not extracted:
             raise ValueError("Profile page did not contain usable text")
         return extracted[:PROFILE_SOURCE_MAX_TEXT_CHARS]
+
+    def _should_retry_profile_source_with_browser(
+        self,
+        *,
+        body: bytes,
+        content_type: str,
+        extracted_text: str,
+    ) -> bool:
+        normalized_type = content_type.split(";", 1)[0].strip().lower()
+        decoded = body.decode("utf-8", errors="ignore")
+        html_lower = decoded.casefold()
+        is_html = normalized_type in {"text/html", "application/xhtml+xml"} or (
+            "<html" in html_lower
+        )
+        if not is_html:
+            return False
+
+        stripped_text = extracted_text.strip()
+        word_count = len(re.findall(r"\w+", stripped_text))
+        is_sparse = (
+            len(stripped_text) <= PROFILE_SOURCE_JS_SPARSE_TEXT_MAX_CHARS
+            and word_count <= PROFILE_SOURCE_JS_SPARSE_TEXT_MAX_WORDS
+        )
+        if not is_sparse:
+            return False
+
+        if any(marker in html_lower for marker in PROFILE_SOURCE_JS_RENDER_MARKERS):
+            return True
+        return (
+            len(decoded) >= PROFILE_SOURCE_JS_HTML_MIN_CHARS and "<script" in html_lower
+        )
+
+    def _rendered_profile_source_text_is_better(
+        self,
+        *,
+        rendered_text: str,
+        extracted_text: str,
+    ) -> bool:
+        rendered = rendered_text.strip()
+        extracted = extracted_text.strip()
+        if not rendered:
+            return False
+        if not extracted:
+            return True
+
+        rendered_words = len(re.findall(r"\w+", rendered))
+        extracted_words = len(re.findall(r"\w+", extracted))
+        return (
+            len(rendered) >= len(extracted) + 20
+            or rendered_words >= extracted_words + 5
+        )
+
+    def _handle_browser_profile_request_route(
+        self,
+        route: Any,
+        response_cache: dict[str, ProfileSourceHttpResponse],
+    ) -> None:
+        request = route.request
+        request_url = str(getattr(request, "url", "")).strip()
+        validation_error = self._validate_browser_profile_request_url(request_url)
+        if validation_error:
+            logger.info(
+                "Blocked non-public browser profile request url=%s error=%s",
+                request_url,
+                validation_error,
+            )
+            route.abort()
+            return
+        scheme = urlsplit(request_url).scheme.lower()
+        if scheme in {"data", "about", "blob"}:
+            route.continue_()
+            return
+
+        request_method = str(getattr(request, "method", "GET")).upper()
+        response = response_cache.get(request_url) if request_method == "GET" else None
+        if response is None:
+            response = self._fetch_browser_profile_request_response(request)
+            if request_method == "GET":
+                response_cache[request_url] = response
+
+        route.fulfill(
+            status=response.status_code,
+            headers=self._browser_route_response_headers(response),
+            body=response.body,
+        )
+
+    def _validate_browser_profile_request_url(self, candidate_url: str) -> str | None:
+        parsed = urlsplit(candidate_url)
+        scheme = parsed.scheme.lower()
+        if not scheme:
+            return "Profile request URL must specify a scheme"
+        if scheme in {"http", "https"}:
+            return self._validate_public_profile_url(candidate_url)
+        if scheme in {"data", "about", "blob"}:
+            return None
+        return f"Profile request URL scheme '{scheme}' is not allowed"
+
+    def _validate_browser_profile_navigation_url(
+        self, candidate_url: str
+    ) -> str | None:
+        parsed = urlsplit(candidate_url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return "Profile URL must use http or https"
+        return self._validate_public_profile_url(candidate_url)
+
+    def _extract_rendered_profile_source_text(self, rendered_html: str) -> str:
+        rendered_body = rendered_html.encode("utf-8")
+        if len(rendered_body) > PROFILE_SOURCE_MAX_BYTES:
+            raise ValueError("Rendered profile page exceeds size limit")
+        return self._extract_profile_source_text(
+            body=rendered_body,
+            content_type="text/html",
+        )
+
+    @staticmethod
+    def _browser_route_response_headers(
+        response: ProfileSourceHttpResponse,
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        content_type = response.content_type
+        if content_type:
+            headers["content-type"] = content_type
+        cache_control = str(response.headers.get("cache-control", "")).strip()
+        if cache_control:
+            headers["cache-control"] = cache_control
+        return headers
 
     def _render_external_profile_source_text(
         self,

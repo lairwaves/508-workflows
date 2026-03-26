@@ -5,12 +5,16 @@ import json
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from unittest.mock import MagicMock, Mock, patch
 
 from curl_cffi import CurlOpt
 
 from five08.clients.espo import EspoAPIError
 from five08.resume_profile_processor import (
+    PROFILE_SOURCE_BROWSER_RESOURCE_MAX_BYTES,
+    PROFILE_SOURCE_MAX_BYTES,
+    ProfileSourceHttpResponse,
     ResumeProcessorConfig,
     _ExternalProfileSourceCandidate,
 )
@@ -266,7 +270,7 @@ def test_extract_profile_proposal_fetches_crm_website_and_github_sources() -> No
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
     processor._fetch_external_profile_source_text = Mock(
-        side_effect=lambda url: {
+        side_effect=lambda url, **_: {
             "https://portfolio.example.com": "Portfolio content",
             "https://github.com/octocat": "GitHub profile content",
         }[url]
@@ -335,7 +339,7 @@ def test_extract_profile_proposal_reruns_with_inferred_github_only() -> None:
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
     processor._fetch_external_profile_source_text = Mock(
-        side_effect=lambda url: {
+        side_effect=lambda url, **_: {
             "https://blog.example.com": "Blog content",
             "https://github.com/octocat": "GitHub profile content",
         }[url]
@@ -468,7 +472,7 @@ def test_extract_profile_proposal_fetches_confirmed_website_and_github_together(
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
     processor._fetch_external_profile_source_text = Mock(
-        side_effect=lambda url: {
+        side_effect=lambda url, **_: {
             "https://blog.example.com": "Blog content",
             "https://github.com/octocat": "GitHub profile content",
         }[url]
@@ -598,7 +602,7 @@ def test_extract_profile_proposal_without_resume_uses_crm_external_sources() -> 
     processor.document_processor = Mock()
     processor._record_processing_run = Mock()
     processor._fetch_external_profile_source_text = Mock(
-        side_effect=lambda url: {
+        side_effect=lambda url, **_: {
             "https://portfolio.example.com": "Portfolio content",
             "https://github.com/octocat": "GitHub profile content",
         }[url]
@@ -724,6 +728,163 @@ def test_fetch_external_profile_sources_retries_alternate_candidate_after_failur
         )
     }
     assert [item.status for item in enrichments] == ["failed", "used"]
+
+
+def test_fetch_external_profile_source_text_uses_browser_for_sparse_personal_site() -> (
+    None
+):
+    """Sparse app-shell HTML should retry personal websites with browser rendering."""
+    processor = ResumeProfileProcessor()
+    processor._fetch_external_profile_source_response = Mock(
+        return_value=ProfileSourceHttpResponse(
+            final_url="https://example.com/about",
+            status_code=200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            body=(
+                b"<html><head><title>Jane Doe</title></head><body>"
+                b"<div id='__next'></div><script>window.__NEXT_DATA__={};</script>"
+                b"</body></html>"
+            ),
+        )
+    )
+    processor._fetch_external_profile_source_text_with_browser = Mock(
+        return_value="Jane Doe is a software engineer based in Tokyo building data products."
+    )
+
+    extracted = processor._fetch_external_profile_source_text(
+        "https://example.com",
+        allow_javascript_fallback=True,
+    )
+
+    assert extracted == (
+        "Jane Doe is a software engineer based in Tokyo building data products."
+    )
+    processor._fetch_external_profile_source_text_with_browser.assert_called_once()
+    browser_call = processor._fetch_external_profile_source_text_with_browser.call_args
+    assert browser_call.args[0].final_url == "https://example.com/about"
+
+
+def test_fetch_external_profile_source_text_skips_browser_for_github_sources() -> None:
+    """Non-website profile sources should stay on the curl path even if sparse."""
+    processor = ResumeProfileProcessor()
+    processor._fetch_external_profile_source_response = Mock(
+        return_value=ProfileSourceHttpResponse(
+            final_url="https://github.com/octocat",
+            status_code=200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            body=(
+                b"<html><head><title>octocat</title></head><body>"
+                b"<div id='__next'></div><script>window.__NEXT_DATA__={};</script>"
+                b"</body></html>"
+            ),
+        )
+    )
+    processor._fetch_external_profile_source_text_with_browser = Mock(
+        return_value="should not be used"
+    )
+
+    extracted = processor._fetch_external_profile_source_text(
+        "https://github.com/octocat",
+        allow_javascript_fallback=False,
+    )
+
+    assert extracted == "Title: octocat\noctocat"
+    processor._fetch_external_profile_source_text_with_browser.assert_not_called()
+    processor._fetch_external_profile_source_response.assert_called_once_with(
+        "https://github.com/octocat"
+    )
+
+
+def test_validate_browser_profile_request_url_blocks_non_public_http_targets() -> None:
+    """Browser fallback requests should reject non-public HTTP(S) targets."""
+    processor = ResumeProfileProcessor()
+
+    assert (
+        processor._validate_browser_profile_request_url("http://127.0.0.1/internal")
+        == "Profile URL host resolves to a non-public address"
+    )
+    assert (
+        processor._validate_browser_profile_request_url("data:text/plain,hello") is None
+    )
+    assert (
+        processor._validate_browser_profile_request_url("file:///etc/passwd")
+        == "Profile request URL scheme 'file' is not allowed"
+    )
+    assert (
+        processor._validate_browser_profile_request_url("ws://example.com/socket")
+        == "Profile request URL scheme 'ws' is not allowed"
+    )
+
+
+def test_validate_browser_profile_navigation_url_rejects_non_http_scheme() -> None:
+    """Top-level browser navigation should remain limited to http(s) URLs."""
+    processor = ResumeProfileProcessor()
+
+    assert (
+        processor._validate_browser_profile_navigation_url("data:text/plain,hello")
+        == "Profile URL must use http or https"
+    )
+
+
+def test_validate_browser_profile_navigation_url_blocks_non_public_target() -> None:
+    """Top-level browser navigation should reject non-public HTTP(S) targets."""
+    processor = ResumeProfileProcessor()
+
+    assert (
+        processor._validate_browser_profile_navigation_url("http://127.0.0.1/internal")
+        == "Profile URL host resolves to a non-public address"
+    )
+
+
+def test_fetch_browser_profile_request_response_preserves_request_shape() -> None:
+    """Browser subrequests should replay the original method, headers, and body."""
+    processor = ResumeProfileProcessor()
+    processor._request_profile_http_response = Mock(
+        return_value=ProfileSourceHttpResponse(
+            final_url="https://example.com/api/profile",
+            status_code=200,
+            headers={"content-type": "application/json"},
+            body=b"{}",
+        )
+    )
+    request = SimpleNamespace(
+        url="https://example.com/api/profile",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Test": "1",
+            "Host": "example.com",
+            "Content-Length": "2",
+        },
+        post_data_buffer=b"{}",
+    )
+
+    response = processor._fetch_browser_profile_request_response(request)
+
+    assert response.final_url == "https://example.com/api/profile"
+    processor._request_profile_http_response.assert_called_once_with(
+        "https://example.com/api/profile",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Test": "1",
+        },
+        body=b"{}",
+        max_bytes=PROFILE_SOURCE_BROWSER_RESOURCE_MAX_BYTES,
+        require_success=False,
+        size_limit_error="Browser profile resource exceeds size limit",
+    )
+
+
+def test_extract_rendered_profile_source_text_enforces_size_limit() -> None:
+    """Rendered browser HTML should honor the same size cap as curl fetches."""
+    processor = ResumeProfileProcessor()
+    oversized_html = (
+        "<html><body>" + ("a" * PROFILE_SOURCE_MAX_BYTES) + "</body></html>"
+    )
+
+    with pytest.raises(ValueError, match="Rendered profile page exceeds size limit"):
+        processor._extract_rendered_profile_source_text(oversized_html)
 
 
 def test_extract_profile_proposal_reruns_with_confirmed_personal_website() -> None:
@@ -944,7 +1105,7 @@ def test_fetch_external_profile_source_text_pins_resolved_public_ips() -> None:
     response.close = Mock()
     session = MagicMock()
     session.__enter__.return_value = session
-    session.get.return_value = response
+    session.request.return_value = response
 
     with (
         patch.object(
@@ -967,7 +1128,7 @@ def test_fetch_external_profile_source_text_pins_resolved_public_ips() -> None:
             "example.com:443:93.184.216.35",
         ]
     }
-    session.get.assert_called_once()
+    session.request.assert_called_once()
     response.close.assert_called_once()
 
 
