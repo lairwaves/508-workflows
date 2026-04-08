@@ -4631,7 +4631,9 @@ class CRMCog(DiscordAuditCogMixin, commands.Cog):
 
         except EspoAPIError as e:
             logger.error(f"Failed to download resume {resume_id}: {e}")
-            await interaction.followup.send(f"❌ Failed to download resume: {str(e)}", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ Failed to download resume: {str(e)}", ephemeral=True
+            )
             return False
 
     def _check_member_role(self, interaction: discord.Interaction) -> bool:
